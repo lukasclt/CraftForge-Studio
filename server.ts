@@ -87,8 +87,22 @@ function getUserProjectsFile(login: string): string {
   return path.join(DATA_DIR, `projects_${safeLogin}.json`);
 }
 
+function getCookieOptions(req: express.Request, maxAge: number): express.CookieOptions {
+  const isHttps =
+    req.secure ||
+    req.headers['x-forwarded-proto'] === 'https' ||
+    (typeof req.headers.origin === 'string' && req.headers.origin.startsWith('https://'));
+  return {
+    httpOnly: true,
+    sameSite: isHttps ? 'none' : 'lax',
+    secure: isHttps,
+    path: '/',
+    maxAge,
+  };
+}
+
 function getSessionFromReq(req: express.Request): AuthSession | null {
-  const sid = req.cookies?.[SESSION_COOKIE];
+  const sid = req.cookies?.[SESSION_COOKIE] || (req.headers['x-session-id'] as string | undefined);
   if (sid && sessions.has(sid)) {
     return sessions.get(sid)!;
   }
@@ -96,7 +110,7 @@ function getSessionFromReq(req: express.Request): AuthSession | null {
   if (authHeader && authHeader.startsWith('Bearer ')) {
     const token = authHeader.slice(7).trim();
     for (const s of sessions.values()) {
-      if (s.token === token) return s;
+      if (s.token === token || s.id === token) return s;
     }
   }
   return null;
@@ -218,13 +232,8 @@ async function startServer() {
         createdAt: Date.now(),
       });
       saveSessionsToDisk();
-      res.cookie(SESSION_COOKIE, sessionId, {
-        httpOnly: true,
-        sameSite: 'lax',
-        path: '/',
-        maxAge: 1000 * 60 * 60 * 24 * 7,
-      });
-      return res.json({ user });
+      res.cookie(SESSION_COOKIE, sessionId, getCookieOptions(req, 1000 * 60 * 60 * 24 * 7));
+      return res.json({ user, sessionId });
     } catch (err) {
       return res.status(401).json({
         error:
@@ -252,13 +261,8 @@ async function startServer() {
       createdAt: Date.now(),
     });
     saveSessionsToDisk();
-    res.cookie(SESSION_COOKIE, sessionId, {
-      httpOnly: true,
-      sameSite: 'lax',
-      path: '/',
-      maxAge: 1000 * 60 * 60 * 2,
-    });
-    return res.json({ user });
+    res.cookie(SESSION_COOKIE, sessionId, getCookieOptions(req, 1000 * 60 * 60 * 2));
+    return res.json({ user, sessionId });
   });
 
   app.get('/api/auth/me', (req, res) => {
@@ -266,16 +270,16 @@ async function startServer() {
     if (!session) {
       return res.status(200).json({ authenticated: false, user: null });
     }
-    return res.json({ authenticated: true, user: session.user });
+    return res.json({ authenticated: true, user: session.user, sessionId: session.id });
   });
 
   app.post('/api/auth/logout', (req, res) => {
-    const sid = req.cookies?.[SESSION_COOKIE];
+    const sid = req.cookies?.[SESSION_COOKIE] || (req.headers['x-session-id'] as string | undefined);
     if (sid) {
       sessions.delete(sid);
       saveSessionsToDisk();
     }
-    res.clearCookie(SESSION_COOKIE, { path: '/' });
+    res.clearCookie(SESSION_COOKIE, getCookieOptions(req, 0));
     return res.json({ ok: true });
   });
 

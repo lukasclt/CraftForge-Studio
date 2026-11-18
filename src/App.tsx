@@ -31,6 +31,12 @@ import { CollaboratorsModal } from './components/CollaboratorsModal';
 import { createStarterProject } from './utils/defaultProjects';
 import { loadProjectCookieMeta, saveProjectsToCookies } from './utils/cookieStorage';
 import {
+  apiFetch,
+  clearClientSession,
+  getStoredGitHubToken,
+  storeClientSession,
+} from './utils/sessionClient';
+import {
   deletePathFromWorkspace,
   getParentFolder,
   normalizePath,
@@ -76,18 +82,39 @@ export default function App() {
     let active = true;
     const initAuth = async () => {
       try {
-        const res = await fetch('/api/auth/me');
+        const res = await apiFetch('/api/auth/me');
         if (res.ok) {
-          const data = (await res.json()) as { authenticated?: boolean; user: GitHubUser | null };
+          const data = (await res.json()) as {
+            authenticated?: boolean;
+            user: GitHubUser | null;
+            sessionId?: string;
+          };
           if (data.authenticated && data.user) {
+            storeClientSession(data.sessionId, null);
             if (active) setUser(data.user);
             return;
           }
         }
+        // Fallback: if a real GitHub token is in sessionStorage (e.g. static proxy), validate directly
+        const storedToken = getStoredGitHubToken();
+        if (storedToken && storedToken !== 'sandbox-autostart-token') {
+          const ghResp = await fetch('https://api.github.com/user', {
+            headers: {
+              Authorization: `Bearer ${storedToken}`,
+              Accept: 'application/vnd.github+json',
+            },
+          });
+          if (ghResp.ok) {
+            const ghUser = (await ghResp.json()) as GitHubUser;
+            if (active) setUser(ghUser);
+            return;
+          }
+        }
         if (autostart) {
-          const sbRes = await fetch('/api/auth/sandbox', { method: 'POST' });
+          const sbRes = await apiFetch('/api/auth/sandbox', { method: 'POST' });
           if (sbRes.ok) {
-            const sbData = (await sbRes.json()) as { user: GitHubUser };
+            const sbData = (await sbRes.json()) as { user: GitHubUser; sessionId?: string };
+            storeClientSession(sbData.sessionId, 'sandbox-autostart-token');
             if (active) setUser(sbData.user);
           }
         }
@@ -113,7 +140,7 @@ export default function App() {
       let serverActiveId: string | null = null;
 
       try {
-        const projRes = await fetch('/api/projects');
+        const projRes = await apiFetch('/api/projects');
         if (projRes.ok) {
           const projData = (await projRes.json()) as {
             projects?: ChatProject[];
@@ -128,7 +155,7 @@ export default function App() {
 
       if (inviteRoomId) {
         try {
-          const roomRes = await fetch(`/api/rooms/${encodeURIComponent(inviteRoomId)}`);
+          const roomRes = await apiFetch(`/api/rooms/${encodeURIComponent(inviteRoomId)}`);
           if (roomRes.ok) {
             const roomData = (await roomRes.json()) as { project?: ChatProject };
             if (roomData.project) {
@@ -168,7 +195,7 @@ export default function App() {
   useEffect(() => {
     if (!user || projects.length === 0 || !activeProjectId) return;
     saveProjectsToCookies(projects, activeProjectId);
-    fetch('/api/projects', {
+    apiFetch('/api/projects', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ projects, activeProjectId }),
@@ -179,7 +206,7 @@ export default function App() {
   useEffect(() => {
     if (!user || !activeProject) return;
 
-    fetch(`/api/rooms/${encodeURIComponent(activeProject.roomId)}/sync`, {
+    apiFetch(`/api/rooms/${encodeURIComponent(activeProject.roomId)}/sync`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ project: activeProject }),
@@ -193,7 +220,13 @@ export default function App() {
 
     ws.onopen = () => {
       setWsConnected(true);
-      ws.send(JSON.stringify({ type: 'join', roomId: activeProject.roomId }));
+      ws.send(
+        JSON.stringify({
+          type: 'join',
+          roomId: activeProject.roomId,
+          token: getStoredGitHubToken() || undefined,
+        })
+      );
     };
 
     ws.onmessage = (event) => {
@@ -575,7 +608,7 @@ export default function App() {
 
     setSendingChat(true);
     try {
-      const resp = await fetch('/api/copilot/chat', {
+      const resp = await apiFetch('/api/copilot/chat', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
@@ -663,7 +696,7 @@ export default function App() {
   ): Promise<{ ok: boolean; error?: string }> => {
     if (!activeProject) return { ok: false, error: 'Nenhum projeto ativo.' };
     try {
-      const resp = await fetch(`/api/github/user/${encodeURIComponent(username)}`);
+      const resp = await apiFetch(`/api/github/user/${encodeURIComponent(username)}`);
       const data = (await resp.json()) as { user?: GitHubUser; error?: string };
       if (!resp.ok || !data.user) {
         return { ok: false, error: data.error || 'Usuário não encontrado.' };
@@ -697,7 +730,7 @@ export default function App() {
 
   const handleJoinRoomByCode = async (targetRoomId: string) => {
     try {
-      const resp = await fetch(`/api/rooms/${encodeURIComponent(targetRoomId)}`);
+      const resp = await apiFetch(`/api/rooms/${encodeURIComponent(targetRoomId)}`);
       if (resp.ok) {
         const data = (await resp.json()) as { project?: ChatProject };
         if (data.project) {
@@ -740,7 +773,8 @@ export default function App() {
   };
 
   const handleLogout = async () => {
-    await fetch('/api/auth/logout', { method: 'POST' }).catch(() => {});
+    await apiFetch('/api/auth/logout', { method: 'POST' }).catch(() => {});
+    clearClientSession();
     setUser(null);
     setProjects([]);
   };

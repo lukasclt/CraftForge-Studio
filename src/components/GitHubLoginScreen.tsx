@@ -1,6 +1,7 @@
 import React, { useState } from 'react';
 import { ExternalLink, Eye, EyeOff, KeyRound, Lock, ShieldCheck, Users } from 'lucide-react';
 import type { GitHubUser } from '../types/ide';
+import { storeClientSession } from '../utils/sessionClient';
 
 interface GitHubLoginScreenProps {
   onAuthenticated: (user: GitHubUser) => void;
@@ -16,6 +17,31 @@ export const GitHubLoginScreen: React.FC<GitHubLoginScreenProps> = ({
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
+  const validateDirectWithGitHub = async (trimmed: string): Promise<GitHubUser> => {
+    const ghResp = await fetch('https://api.github.com/user', {
+      headers: {
+        Authorization: `Bearer ${trimmed}`,
+        Accept: 'application/vnd.github+json',
+      },
+    });
+    if (!ghResp.ok) {
+      const msg = await ghResp.text().catch(() => '');
+      throw new Error(
+        ghResp.status === 401
+          ? 'Token do GitHub inválido ou expirado (401).'
+          : `GitHub API retornou ${ghResp.status}: ${msg.slice(0, 140)}`
+      );
+    }
+    const ghData = (await ghResp.json()) as GitHubUser;
+    return {
+      id: ghData.id,
+      login: ghData.login,
+      name: ghData.name,
+      avatar_url: ghData.avatar_url,
+      html_url: ghData.html_url,
+    };
+  };
+
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
     const trimmed = token.trim();
@@ -30,17 +56,49 @@ export const GitHubLoginScreen: React.FC<GitHubLoginScreenProps> = ({
     try {
       const resp = await fetch('/api/auth/github', {
         method: 'POST',
+        credentials: 'include',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ token: trimmed }),
       });
-      const data = (await resp.json()) as { user?: GitHubUser; error?: string };
-      if (!resp.ok || !data.user) {
-        setError(data.error || 'Token inválido ou sem acesso à API do GitHub.');
+
+      const rawText = await resp.text();
+      let data: { user?: GitHubUser; sessionId?: string; error?: string } | null = null;
+      try {
+        data = JSON.parse(rawText) as { user?: GitHubUser; sessionId?: string; error?: string };
+      } catch {
+        data = null;
+      }
+
+      if (data && resp.ok && data.user) {
+        storeClientSession(data.sessionId, trimmed);
+        onAuthenticated(data.user);
         return;
       }
-      onAuthenticated(data.user);
-    } catch {
-      setError('Erro de conexão com o servidor ao validar seu GitHub Token.');
+
+      if (data && !resp.ok) {
+        setError(data.error || `Token inválido ou sem acesso à API do GitHub (${resp.status}).`);
+        return;
+      }
+
+      // If the backend returned a non-JSON proxy/static response, validate directly with GitHub API
+      const directUser = await validateDirectWithGitHub(trimmed);
+      storeClientSession(null, trimmed);
+      onAuthenticated(directUser);
+    } catch (err) {
+      // Fallback to direct GitHub REST API if /api/auth/github could not be reached
+      try {
+        const directUser = await validateDirectWithGitHub(trimmed);
+        storeClientSession(null, trimmed);
+        onAuthenticated(directUser);
+      } catch (ghErr) {
+        const detail =
+          ghErr instanceof Error
+            ? ghErr.message
+            : err instanceof Error
+              ? err.message
+              : 'Erro de conexão ao validar seu GitHub Token.';
+        setError(detail);
+      }
     } finally {
       setLoading(false);
     }
