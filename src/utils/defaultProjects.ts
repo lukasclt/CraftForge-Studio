@@ -29,6 +29,13 @@ export function createStarterProject(
     id: `proj_${now.toString(36)}_${Math.random().toString(36).slice(2, 6)}`,
     roomId: `room_${Math.random().toString(36).slice(2, 8)}`,
     config,
+    githubActions: {
+      repoFullName: owner && !owner.isSandbox ? `${owner.login}/${config.artifactId}` : '',
+      branch: 'main',
+      autoBuildOnChange: true,
+      autoFixErrors: true,
+      autoDownloadJar: true,
+    },
     files,
     folders,
     messages: [

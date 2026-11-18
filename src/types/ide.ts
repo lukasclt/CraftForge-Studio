@@ -83,10 +83,38 @@ export interface Collaborator {
   addedAt: number;
 }
 
+export interface GitHubActionsConfig {
+  repoFullName: string;
+  branch: string;
+  autoBuildOnChange: boolean;
+  autoFixErrors: boolean;
+  autoDownloadJar: boolean;
+}
+
+export interface GitHubBuildArtifact {
+  id: number;
+  name: string;
+  sizeInBytes: number;
+  downloadUrl: string;
+}
+
+export interface GitHubBuildRun {
+  id: number;
+  status: 'queued' | 'in_progress' | 'completed' | 'error';
+  conclusion: 'success' | 'failure' | 'cancelled' | 'skipped' | null;
+  htmlUrl: string;
+  commitSha?: string;
+  createdAt: string;
+  logsExcerpt?: string;
+  artifacts?: GitHubBuildArtifact[];
+  autoFixAttempt?: number;
+}
+
 export interface ChatProject {
   id: string;
   roomId: string;
   config: ProjectConfig;
+  githubActions?: GitHubActionsConfig;
   files: Record<string, VirtualFile>;
   folders: string[];
   messages: ChatMessage[];

@@ -207,12 +207,12 @@ export const GitHubLoginScreen: React.FC<GitHubLoginScreenProps> = ({
                 <span>Criar Key no GitHub (Fine-grained Token)</span>
               </a>
               <a
-                href="https://github.com/settings/tokens/new?description=CraftForge%20Studio&scopes=read:user"
+                href="https://github.com/settings/tokens/new?description=CraftForge%20Studio&scopes=read:user,repo,workflow"
                 target="_blank"
                 rel="noopener noreferrer"
                 className="text-center text-[11px] text-slate-400 hover:text-emerald-400 underline underline-offset-2 transition-colors"
               >
-                Ou criar Token Clássico (read:user) na API do GitHub
+                Ou criar Token Clássico (read:user, repo, workflow) na API do GitHub
               </a>
             </div>
           </form>

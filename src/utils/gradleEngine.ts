@@ -6,6 +6,7 @@ import type {
   ProjectPlatform,
   VirtualFile,
 } from '../types/ide';
+import { WORKFLOW_FILE_PATH, generateGradleWorkflowYaml } from './githubActionsEngine';
 
 export const MINECRAFT_VERSIONS: readonly string[] = [
   '1.21.5',
@@ -810,6 +811,8 @@ public class ${mainClassName} {
 `
     );
   }
+
+  addFile(WORKFLOW_FILE_PATH, generateGradleWorkflowYaml(config));
 
   const folderSet = new Set<string>();
   for (const filePath of Object.keys(files)) {

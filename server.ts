@@ -7,18 +7,26 @@ import fs from 'fs';
 import crypto from 'crypto';
 import { WebSocketServer, WebSocket } from 'ws';
 import { createServer as createViteServer } from 'vite';
+import JSZip from 'jszip';
 import {
   COPILOT_TOOL_DEFINITIONS,
   executeWorkspaceTool,
   extractThinkingFromContent,
   type WorkspaceMutableState,
 } from './src/utils/agentTools.ts';
+import {
+  WORKFLOW_FILE_PATH,
+  extractRelevantGradleErrors,
+  generateGradleWorkflowYaml,
+} from './src/utils/githubActionsEngine.ts';
 import type {
   ChatMessage,
   ChatProject,
   Collaborator,
+  GitHubBuildRun,
   GitHubUser,
   ToolCallRecord,
+  VirtualFile,
   VisionAttachment,
 } from './src/types/ide.ts';
 
@@ -51,6 +59,7 @@ if (!fs.existsSync(DATA_DIR)) {
 const SESSIONS_FILE = path.join(DATA_DIR, 'sessions.json');
 const sessions = new Map<string, AuthSession>();
 const rooms = new Map<string, RoomState>();
+const sandboxBuildRuns = new Map<string, { attempt: number; run: GitHubBuildRun; polls: number }>();
 
 function loadSessionsFromDisk() {
   try {
@@ -378,6 +387,502 @@ async function startServer() {
     }
   });
 
+  // --- GitHub Actions: Create Repository ---
+  app.post('/api/github/actions/create-repo', async (req, res) => {
+    const session = getSessionFromReq(req);
+    if (!session) {
+      return res.status(401).json({ error: 'Login obrigatório com GitHub Token.' });
+    }
+    const name = String(req.body?.name || '').trim().replace(/[^a-zA-Z0-9._-]/g, '-');
+    const isPrivate = Boolean(req.body?.isPrivate ?? true);
+    const description = String(req.body?.description || 'Projeto Minecraft Gradle via CraftForge Studio');
+    if (!name) {
+      return res.status(400).json({ error: 'Informe um nome válido para o repositório.' });
+    }
+
+    if (session.user.isSandbox) {
+      return res.json({
+        repoFullName: `${session.user.login}/${name}`,
+        defaultBranch: 'main',
+        htmlUrl: `https://github.com/${session.user.login}/${name}`,
+      });
+    }
+
+    try {
+      const resp = await fetch('https://api.github.com/user/repos', {
+        method: 'POST',
+        headers: {
+          Authorization: `Bearer ${session.token}`,
+          Accept: 'application/vnd.github+json',
+          'Content-Type': 'application/json',
+          'User-Agent': 'CraftForge-Studio',
+        },
+        body: JSON.stringify({
+          name,
+          private: isPrivate,
+          description,
+          auto_init: true,
+        }),
+      });
+      const data = (await resp.json().catch(() => ({}))) as {
+        full_name?: string;
+        default_branch?: string;
+        html_url?: string;
+        message?: string;
+      };
+      if (!resp.ok || !data.full_name) {
+        return res.status(resp.status || 400).json({
+          error:
+            data.message ||
+            `GitHub API ${resp.status}: verifique se o token possui permissão "repo".`,
+        });
+      }
+      return res.json({
+        repoFullName: data.full_name,
+        defaultBranch: data.default_branch || 'main',
+        htmlUrl: data.html_url || `https://github.com/${data.full_name}`,
+      });
+    } catch {
+      return res.status(502).json({ error: 'Erro ao criar repositório na API do GitHub.' });
+    }
+  });
+
+  // --- GitHub Actions: Push Files Atomically & Trigger Gradle Build ---
+  app.post('/api/github/actions/trigger', async (req, res) => {
+    const session = getSessionFromReq(req);
+    if (!session) {
+      return res.status(401).json({ error: 'Login obrigatório com GitHub Token.' });
+    }
+    const {
+      repoFullName,
+      branch = 'main',
+      files,
+      config,
+      commitMessage = 'CraftForge Studio: update Gradle Minecraft project',
+      autoFixAttempt = 0,
+    } = req.body as {
+      repoFullName: string;
+      branch?: string;
+      files: Record<string, VirtualFile>;
+      config?: ChatProject['config'];
+      commitMessage?: string;
+      autoFixAttempt?: number;
+    };
+
+    const parts = String(repoFullName || '').trim().split('/');
+    if (parts.length !== 2 || !parts[0] || !parts[1]) {
+      return res.status(400).json({ error: 'Informe o repositório no formato usuario/repositorio.' });
+    }
+    const [owner, repo] = parts;
+
+    if (session.user.isSandbox) {
+      const prev = sandboxBuildRuns.get(repoFullName);
+      const nextAttempt = autoFixAttempt > 0 ? autoFixAttempt + 1 : (prev?.attempt || 0) + 1;
+      const runId = 7000 + nextAttempt;
+      const commitSha = `sb_${Date.now().toString(16)}`;
+      const run: GitHubBuildRun = {
+        id: runId,
+        status: 'in_progress',
+        conclusion: null,
+        htmlUrl: `https://github.com/${owner}/${repo}/actions/runs/${runId}`,
+        commitSha,
+        createdAt: new Date().toISOString(),
+        autoFixAttempt,
+      };
+      sandboxBuildRuns.set(repoFullName, { attempt: nextAttempt, run, polls: 0 });
+      return res.json({ run, commitSha });
+    }
+
+    const ghHeaders = {
+      Authorization: `Bearer ${session.token}`,
+      Accept: 'application/vnd.github+json',
+      'Content-Type': 'application/json',
+      'User-Agent': 'CraftForge-Studio',
+    };
+
+    try {
+      // Ensure workflow YAML exists in pushed files
+      const allFiles: Record<string, VirtualFile> = { ...(files || {}) };
+      if (!allFiles[WORKFLOW_FILE_PATH] && config) {
+        allFiles[WORKFLOW_FILE_PATH] = {
+          path: WORKFLOW_FILE_PATH,
+          content: generateGradleWorkflowYaml(config),
+          updatedAt: Date.now(),
+        };
+      }
+
+      // 1. Get branch ref (initialize repo with README if empty)
+      let headSha = '';
+      const refResp = await fetch(
+        `https://api.github.com/repos/${owner}/${repo}/git/ref/heads/${encodeURIComponent(branch)}`,
+        { headers: ghHeaders }
+      );
+
+      if (refResp.status === 404 || refResp.status === 409) {
+        const initResp = await fetch(
+          `https://api.github.com/repos/${owner}/${repo}/contents/README.md`,
+          {
+            method: 'PUT',
+            headers: ghHeaders,
+            body: JSON.stringify({
+              message: 'chore: initialize CraftForge Gradle repository',
+              content: Buffer.from(`# ${repo}\n\nProjeto Minecraft Gradle gerenciado no CraftForge Studio.\n`).toString('base64'),
+              branch,
+            }),
+          }
+        );
+        if (!initResp.ok) {
+          const errData = (await initResp.json().catch(() => ({}))) as { message?: string };
+          return res.status(initResp.status).json({
+            error: `Falha ao inicializar branch ${branch}: ${errData.message || initResp.status}`,
+          });
+        }
+        const initJson = (await initResp.json()) as { commit?: { sha?: string } };
+        headSha = initJson.commit?.sha || '';
+      } else if (!refResp.ok) {
+        const errData = (await refResp.json().catch(() => ({}))) as { message?: string };
+        return res.status(refResp.status).json({
+          error: `Erro ao acessar repositório ${owner}/${repo}: ${errData.message || refResp.status}`,
+        });
+      } else {
+        const refJson = (await refResp.json()) as { object?: { sha?: string } };
+        headSha = refJson.object?.sha || '';
+      }
+
+      // 2. Get base tree SHA
+      const commitInfoResp = await fetch(
+        `https://api.github.com/repos/${owner}/${repo}/git/commits/${headSha}`,
+        { headers: ghHeaders }
+      );
+      const commitInfo = (await commitInfoResp.json()) as { tree?: { sha?: string } };
+      const baseTreeSha = commitInfo.tree?.sha;
+
+      // 3. Create blobs & tree entries
+      const treeItems: Array<{ path: string; mode: string; type: 'blob'; sha: string }> = [];
+      for (const [filePath, vfile] of Object.entries(allFiles)) {
+        const blobResp = await fetch(`https://api.github.com/repos/${owner}/${repo}/git/blobs`, {
+          method: 'POST',
+          headers: ghHeaders,
+          body: JSON.stringify({
+            content: vfile.content,
+            encoding: 'utf-8',
+          }),
+        });
+        if (!blobResp.ok) {
+          const errData = (await blobResp.json().catch(() => ({}))) as { message?: string };
+          return res.status(blobResp.status).json({
+            error: `Erro ao enviar ${filePath}: ${errData.message || blobResp.status}`,
+          });
+        }
+        const blobJson = (await blobResp.json()) as { sha: string };
+        treeItems.push({
+          path: filePath,
+          mode: filePath === 'gradlew' ? '100755' : '100644',
+          type: 'blob',
+          sha: blobJson.sha,
+        });
+      }
+
+      // 4. Create tree
+      const treeResp = await fetch(`https://api.github.com/repos/${owner}/${repo}/git/trees`, {
+        method: 'POST',
+        headers: ghHeaders,
+        body: JSON.stringify({
+          base_tree: baseTreeSha,
+          tree: treeItems,
+        }),
+      });
+      if (!treeResp.ok) {
+        const errData = (await treeResp.json().catch(() => ({}))) as { message?: string };
+        return res.status(treeResp.status).json({
+          error: `Erro ao criar árvore Git: ${errData.message || treeResp.status}`,
+        });
+      }
+      const treeJson = (await treeResp.json()) as { sha: string };
+
+      // 5. Create commit
+      const newCommitResp = await fetch(`https://api.github.com/repos/${owner}/${repo}/git/commits`, {
+        method: 'POST',
+        headers: ghHeaders,
+        body: JSON.stringify({
+          message: commitMessage,
+          tree: treeJson.sha,
+          parents: [headSha],
+        }),
+      });
+      if (!newCommitResp.ok) {
+        const errData = (await newCommitResp.json().catch(() => ({}))) as { message?: string };
+        return res.status(newCommitResp.status).json({
+          error: `Erro ao criar commit: ${errData.message || newCommitResp.status}`,
+        });
+      }
+      const newCommitJson = (await newCommitResp.json()) as { sha: string };
+
+      // 6. Update branch ref (triggers push workflow)
+      const patchRefResp = await fetch(
+        `https://api.github.com/repos/${owner}/${repo}/git/refs/heads/${encodeURIComponent(branch)}`,
+        {
+          method: 'PATCH',
+          headers: ghHeaders,
+          body: JSON.stringify({ sha: newCommitJson.sha }),
+        }
+      );
+      if (!patchRefResp.ok) {
+        const errData = (await patchRefResp.json().catch(() => ({}))) as { message?: string };
+        return res.status(patchRefResp.status).json({
+          error: `Erro ao atualizar branch ${branch}: ${errData.message || patchRefResp.status}`,
+        });
+      }
+
+      return res.json({
+        commitSha: newCommitJson.sha,
+        run: {
+          id: 0,
+          status: 'queued',
+          conclusion: null,
+          htmlUrl: `https://github.com/${owner}/${repo}/actions`,
+          commitSha: newCommitJson.sha,
+          createdAt: new Date().toISOString(),
+          autoFixAttempt,
+        } satisfies GitHubBuildRun,
+      });
+    } catch (err) {
+      return res.status(502).json({
+        error:
+          err instanceof Error
+            ? `Erro ao iniciar build no GitHub Actions: ${err.message}`
+            : 'Erro ao iniciar build no GitHub Actions.',
+      });
+    }
+  });
+
+  // --- GitHub Actions: Poll Status, Logs & Artifacts ---
+  app.get('/api/github/actions/status', async (req, res) => {
+    const session = getSessionFromReq(req);
+    if (!session) {
+      return res.status(401).json({ error: 'Login obrigatório com GitHub Token.' });
+    }
+    const repoFullName = String(req.query.repo || '').trim();
+    const commitSha = String(req.query.commitSha || '').trim();
+    const runIdParam = Number(req.query.runId || 0);
+    const parts = repoFullName.split('/');
+    if (parts.length !== 2 || !parts[0] || !parts[1]) {
+      return res.status(400).json({ error: 'Repositório inválido.' });
+    }
+    const [owner, repo] = parts;
+
+    if (session.user.isSandbox) {
+      const entry = sandboxBuildRuns.get(repoFullName);
+      if (!entry) {
+        return res.json({ run: null });
+      }
+      entry.polls += 1;
+      // Attempt 1 fails with a realistic Gradle compilation error; Attempt >= 2 succeeds with JAR artifact!
+      if (entry.polls >= 1) {
+        if (entry.attempt === 1) {
+          entry.run = {
+            ...entry.run,
+            status: 'completed',
+            conclusion: 'failure',
+            logsExcerpt:
+              '> Task :compileJava FAILED\nsrc/main/java/com/craftforge/arenapvp/ArenaPvPPlugin.java:18: error: cannot find symbol\n  symbol:   method registerBrokenPlaceholder()\n  location: class ArenaPvPPlugin\nFAILURE: Build failed with an exception.',
+          };
+        } else {
+          entry.run = {
+            ...entry.run,
+            status: 'completed',
+            conclusion: 'success',
+            artifacts: [
+              {
+                id: 9001,
+                name: 'minecraft-build-jar',
+                sizeInBytes: 4280,
+                downloadUrl: `/api/github/actions/artifact?repo=${encodeURIComponent(repoFullName)}&artifactId=9001&filename=${encodeURIComponent(`${repo}-1.0.0.jar`)}`,
+              },
+            ],
+          };
+        }
+      }
+      return res.json({ run: entry.run });
+    }
+
+    const ghHeaders = {
+      Authorization: `Bearer ${session.token}`,
+      Accept: 'application/vnd.github+json',
+      'User-Agent': 'CraftForge-Studio',
+    };
+
+    try {
+      const runsResp = await fetch(
+        `https://api.github.com/repos/${owner}/${repo}/actions/runs?per_page=10`,
+        { headers: ghHeaders }
+      );
+      if (!runsResp.ok) {
+        return res.status(runsResp.status).json({
+          error: `GitHub Actions API ${runsResp.status}`,
+        });
+      }
+      const runsData = (await runsResp.json()) as {
+        workflow_runs?: Array<{
+          id: number;
+          status: string;
+          conclusion: string | null;
+          html_url: string;
+          head_sha: string;
+          created_at: string;
+        }>;
+      };
+
+      const matched =
+        runsData.workflow_runs?.find((r) => (runIdParam > 0 ? r.id === runIdParam : false)) ||
+        runsData.workflow_runs?.find((r) => (commitSha ? r.head_sha === commitSha : false)) ||
+        runsData.workflow_runs?.[0];
+
+      if (!matched) {
+        return res.json({
+          run: {
+            id: 0,
+            status: 'queued',
+            conclusion: null,
+            htmlUrl: `https://github.com/${owner}/${repo}/actions`,
+            commitSha,
+            createdAt: new Date().toISOString(),
+          } satisfies GitHubBuildRun,
+        });
+      }
+
+      const resultRun: GitHubBuildRun = {
+        id: matched.id,
+        status: (matched.status as GitHubBuildRun['status']) || 'queued',
+        conclusion: (matched.conclusion as GitHubBuildRun['conclusion']) || null,
+        htmlUrl: matched.html_url,
+        commitSha: matched.head_sha,
+        createdAt: matched.created_at,
+      };
+
+      if (resultRun.status === 'completed' && resultRun.conclusion === 'failure') {
+        try {
+          const jobsResp = await fetch(
+            `https://api.github.com/repos/${owner}/${repo}/actions/runs/${matched.id}/jobs`,
+            { headers: ghHeaders }
+          );
+          if (jobsResp.ok) {
+            const jobsData = (await jobsResp.json()) as {
+              jobs?: Array<{ id: number; conclusion: string | null }>;
+            };
+            const failedJob =
+              jobsData.jobs?.find((j) => j.conclusion === 'failure') || jobsData.jobs?.[0];
+            if (failedJob) {
+              const logsResp = await fetch(
+                `https://api.github.com/repos/${owner}/${repo}/actions/jobs/${failedJob.id}/logs`,
+                { headers: ghHeaders }
+              );
+              if (logsResp.ok) {
+                const rawLogs = await logsResp.text();
+                resultRun.logsExcerpt = extractRelevantGradleErrors(rawLogs);
+              }
+            }
+          }
+        } catch {
+          // ignore log fetch error
+        }
+      }
+
+      if (resultRun.status === 'completed' && resultRun.conclusion === 'success') {
+        try {
+          const artResp = await fetch(
+            `https://api.github.com/repos/${owner}/${repo}/actions/runs/${matched.id}/artifacts`,
+            { headers: ghHeaders }
+          );
+          if (artResp.ok) {
+            const artData = (await artResp.json()) as {
+              artifacts?: Array<{ id: number; name: string; size_in_bytes: number }>;
+            };
+            resultRun.artifacts = (artData.artifacts || []).map((a) => ({
+              id: a.id,
+              name: a.name,
+              sizeInBytes: a.size_in_bytes,
+              downloadUrl: `/api/github/actions/artifact?repo=${encodeURIComponent(repoFullName)}&artifactId=${a.id}&filename=${encodeURIComponent(`${repo}.jar`)}`,
+            }));
+          }
+        } catch {
+          // ignore artifact list error
+        }
+      }
+
+      return res.json({ run: resultRun });
+    } catch {
+      return res.status(502).json({ error: 'Erro ao consultar status do GitHub Actions.' });
+    }
+  });
+
+  // --- GitHub Actions: Download Compiled JAR (extracts .jar from GitHub artifact zip) ---
+  app.get('/api/github/actions/artifact', async (req, res) => {
+    const session = getSessionFromReq(req);
+    if (!session) {
+      return res.status(401).json({ error: 'Login obrigatório com GitHub Token.' });
+    }
+    const repoFullName = String(req.query.repo || '').trim();
+    const artifactId = Number(req.query.artifactId || 0);
+    const desiredName = String(req.query.filename || 'minecraft-plugin.jar').replace(
+      /[^a-zA-Z0-9._-]/g,
+      '_'
+    );
+    const parts = repoFullName.split('/');
+    if (parts.length !== 2 || !artifactId) {
+      return res.status(400).json({ error: 'Parâmetros de artefato inválidos.' });
+    }
+    const [owner, repo] = parts;
+
+    if (session.user.isSandbox) {
+      const jarZip = new JSZip();
+      jarZip.file(
+        'META-INF/MANIFEST.MF',
+        'Manifest-Version: 1.0\nCreated-By: CraftForge Studio Gradle Actions\n'
+      );
+      const buf = await jarZip.generateAsync({ type: 'nodebuffer' });
+      res.setHeader('Content-Type', 'application/java-archive');
+      res.setHeader('Content-Disposition', `attachment; filename="${desiredName}"`);
+      return res.send(buf);
+    }
+
+    try {
+      const zipResp = await fetch(
+        `https://api.github.com/repos/${owner}/${repo}/actions/artifacts/${artifactId}/zip`,
+        {
+          headers: {
+            Authorization: `Bearer ${session.token}`,
+            Accept: 'application/vnd.github+json',
+            'User-Agent': 'CraftForge-Studio',
+          },
+        }
+      );
+      if (!zipResp.ok) {
+        return res.status(zipResp.status).json({
+          error: `Erro ao baixar artefato do GitHub (${zipResp.status}).`,
+        });
+      }
+      const arrBuf = await zipResp.arrayBuffer();
+      const loadedZip = await JSZip.loadAsync(arrBuf);
+      const jarEntryName = Object.keys(loadedZip.files).find(
+        (name) => name.endsWith('.jar') && !loadedZip.files[name].dir
+      );
+      if (jarEntryName) {
+        const jarBuf = await loadedZip.files[jarEntryName].async('nodebuffer');
+        const outName = jarEntryName.split('/').pop() || desiredName;
+        res.setHeader('Content-Type', 'application/java-archive');
+        res.setHeader('Content-Disposition', `attachment; filename="${outName}"`);
+        return res.send(jarBuf);
+      }
+
+      res.setHeader('Content-Type', 'application/zip');
+      res.setHeader('Content-Disposition', `attachment; filename="${desiredName}.zip"`);
+      return res.send(Buffer.from(arrBuf));
+    } catch {
+      return res.status(502).json({ error: 'Falha ao processar download do artefato.' });
+    }
+  });
+
   // --- Room State & Invite Sync ---
   app.get('/api/rooms/:roomId', (req, res) => {
     const session = getSessionFromReq(req);
@@ -479,7 +984,7 @@ async function startServer() {
       workingState = listTool.state;
       executedToolCalls.push(listTool.record);
 
-      if (/criar|add|módulo|module|comando|command|pvp|kb|reach/i.test(userPrompt)) {
+      if (/erro|corrig|fix|log|build|actions|falh|criar|add|módulo|module|comando|command|pvp|kb|reach/i.test(userPrompt)) {
         const pkgPath = workingState.config.groupId.replace(/\./g, '/');
         const targetPath = `src/main/java/${pkgPath}/CopilotGeneratedFeature.java`;
         const writeTool = executeWorkspaceTool(
@@ -488,7 +993,7 @@ async function startServer() {
           'write_file',
           {
             path: targetPath,
-            content: `package ${workingState.config.groupId};\n\n// Gerado via Gradle Toolchain Java ${workingState.config.javaVersion} (MC ${workingState.config.minecraftVersion})\npublic class CopilotGeneratedFeature {\n    public static String describe() {\n        return "Recurso criado pelo Agente para ${workingState.config.name}";\n    }\n}\n`,
+            content: `package ${workingState.config.groupId};\n\n// Gerado/Corrigido via Gradle Toolchain Java ${workingState.config.javaVersion} (MC ${workingState.config.minecraftVersion})\npublic class CopilotGeneratedFeature {\n    public static String describe() {\n        return "Código validado para ${workingState.config.name}";\n    }\n}\n`,
           },
           session.user.login
         );

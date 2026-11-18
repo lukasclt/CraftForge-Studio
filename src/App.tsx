@@ -6,8 +6,10 @@ import {
   Download,
   Files,
   FolderKanban,
+  Loader2,
   LogOut,
   Plus,
+  Rocket,
   Settings2,
   Users,
 } from 'lucide-react';
@@ -15,6 +17,8 @@ import type {
   ChatMessage,
   ChatProject,
   Collaborator,
+  GitHubActionsConfig,
+  GitHubBuildRun,
   GitHubUser,
   ProjectConfig,
   ThinkingEffort,
@@ -24,6 +28,7 @@ import { GitHubLoginScreen } from './components/GitHubLoginScreen';
 import { FileExplorer } from './components/FileExplorer';
 import { ProjectsSidebar } from './components/ProjectsSidebar';
 import { GradleConfigSidebar } from './components/GradleConfigSidebar';
+import { GitHubActionsSidebar } from './components/GitHubActionsSidebar';
 import { CodeEditorPane } from './components/CodeEditorPane';
 import { CopilotAgentChat } from './components/CopilotAgentChat';
 import { NewProjectModal } from './components/NewProjectModal';
@@ -43,8 +48,12 @@ import {
   renamePathInWorkspace,
 } from './utils/fileTree';
 import { generateGradleProjectFiles } from './utils/gradleEngine';
+import {
+  shouldTriggerAutoDownload,
+  shouldTriggerAutoFix,
+} from './utils/githubActionsEngine';
 
-type LeftTab = 'files' | 'projects' | 'gradle';
+type LeftTab = 'files' | 'projects' | 'gradle' | 'actions';
 type MobilePane = 'explorer' | 'editor' | 'chat';
 
 export default function App() {
@@ -71,6 +80,15 @@ export default function App() {
   const [wsConnected, setWsConnected] = useState(false);
   const [onlineUsers, setOnlineUsers] = useState<GitHubUser[]>([]);
   const wsRef = useRef<WebSocket | null>(null);
+
+  // GitHub Actions state
+  const [buildRun, setBuildRun] = useState<GitHubBuildRun | null>(null);
+  const [triggeringBuild, setTriggeringBuild] = useState(false);
+  const [autoFixingBuild, setAutoFixingBuild] = useState(false);
+  const [actionsError, setActionsError] = useState<string | null>(null);
+  const consecutiveFixRetriesRef = useRef(0);
+  const downloadedRunIdsRef = useRef<Set<number>>(new Set());
+  const handledFailedRunIdsRef = useRef<Set<number>>(new Set());
 
   const urlParams =
     typeof window !== 'undefined' ? new URLSearchParams(window.location.search) : null;
@@ -190,6 +208,27 @@ export default function App() {
   }, [user, inviteRoomId]);
 
   const activeProject = projects.find((p) => p.id === activeProjectId) || projects[0] || null;
+  const activeProjectRef = useRef<ChatProject | null>(activeProject);
+  activeProjectRef.current = activeProject;
+
+  const getProjectActionsConfig = useCallback(
+    (proj: ChatProject | null): GitHubActionsConfig => {
+      if (proj?.githubActions) return proj.githubActions;
+      return {
+        repoFullName:
+          user && !user.isSandbox && proj
+            ? `${user.login}/${proj.config.artifactId}`
+            : '',
+        branch: 'main',
+        autoBuildOnChange: true,
+        autoFixErrors: true,
+        autoDownloadJar: true,
+      };
+    },
+    [user]
+  );
+
+  const activeActionsConfig = getProjectActionsConfig(activeProject);
 
   // Save compact metadata to cookies & full workspace/chat to session-cookie-keyed store
   useEffect(() => {
@@ -338,6 +377,89 @@ export default function App() {
     }
   }
 
+  const downloadArtifactFile = useCallback(async (downloadUrl: string, filename: string) => {
+    try {
+      const resp = await apiFetch(downloadUrl);
+      if (!resp.ok) {
+        const errData = (await resp.json().catch(() => ({}))) as { error?: string };
+        setActionsError(errData.error || `Erro ao baixar artefato (${resp.status}).`);
+        return;
+      }
+      const blob = await resp.blob();
+      const blobUrl = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = blobUrl;
+      a.download = filename;
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
+      setTimeout(() => URL.revokeObjectURL(blobUrl), 1000);
+    } catch {
+      setActionsError('Falha de rede ao baixar o arquivo .jar compilado.');
+    }
+  }, []);
+
+  const triggerGitHubActionsBuild = useCallback(
+    async (
+      projOverride?: ChatProject,
+      commitMessage?: string,
+      autoFixAttempt = 0
+    ): Promise<boolean> => {
+      const targetProj = projOverride || activeProjectRef.current;
+      if (!targetProj) return false;
+      const actionsCfg = getProjectActionsConfig(targetProj);
+      const repoFullName = actionsCfg.repoFullName.trim();
+      if (!repoFullName) {
+        setActionsError('Configure ou crie um repositório GitHub antes de iniciar o build.');
+        return false;
+      }
+
+      setTriggeringBuild(true);
+      setActionsError(null);
+      try {
+        const mergedFiles = { ...targetProj.files };
+        if (targetProj.id === activeProjectRef.current?.id) {
+          for (const [fPath, draft] of Object.entries(draftContents)) {
+            if (mergedFiles[fPath]) {
+              mergedFiles[fPath] = { ...mergedFiles[fPath], content: draft };
+            }
+          }
+        }
+
+        const resp = await apiFetch('/api/github/actions/trigger', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            repoFullName,
+            branch: actionsCfg.branch || 'main',
+            files: mergedFiles,
+            config: targetProj.config,
+            commitMessage:
+              commitMessage ||
+              `CraftForge Studio: build ${targetProj.config.name} (${targetProj.config.minecraftVersion})`,
+            autoFixAttempt,
+          }),
+        });
+        const data = (await resp.json().catch(() => ({}))) as {
+          run?: GitHubBuildRun;
+          error?: string;
+        };
+        if (!resp.ok || !data.run) {
+          setActionsError(data.error || `Erro HTTP ${resp.status} ao iniciar build.`);
+          return false;
+        }
+        setBuildRun(data.run);
+        return true;
+      } catch {
+        setActionsError('Falha de conexão ao disparar workflow no GitHub Actions.');
+        return false;
+      } finally {
+        setTriggeringBuild(false);
+      }
+    },
+    [draftContents, getProjectActionsConfig]
+  );
+
   const handleSaveFile = useCallback(
     (path: string) => {
       if (!activeProject) return;
@@ -345,10 +467,11 @@ export default function App() {
       if (contentToSave === undefined) return;
       const now = Date.now();
 
-      updateActiveProject((proj) => ({
-        ...proj,
+      const updatedProj: ChatProject = {
+        ...activeProject,
+        updatedAt: now,
         files: {
-          ...proj.files,
+          ...activeProject.files,
           [path]: {
             path,
             content: contentToSave,
@@ -356,7 +479,11 @@ export default function App() {
             updatedBy: user?.login,
           },
         },
-      }));
+      };
+
+      setProjects((prev) =>
+        prev.map((p) => (p.id === activeProject.id ? updatedProj : p))
+      );
 
       setDraftContents((prev) => {
         const next = { ...prev };
@@ -373,8 +500,24 @@ export default function App() {
           })
         );
       }
+
+      const actionsCfg = getProjectActionsConfig(updatedProj);
+      if (actionsCfg.autoBuildOnChange && actionsCfg.repoFullName.trim()) {
+        consecutiveFixRetriesRef.current = 0;
+        void triggerGitHubActionsBuild(
+          updatedProj,
+          `CraftForge Studio: salvar ${path}`,
+          0
+        );
+      }
     },
-    [activeProject, draftContents, updateActiveProject, user?.login]
+    [
+      activeProject,
+      draftContents,
+      getProjectActionsConfig,
+      triggerGitHubActionsBuild,
+      user?.login,
+    ]
   );
 
   // Global CTRL + S / CMD + S handler
@@ -536,6 +679,12 @@ export default function App() {
           'gradle.properties': generated.files['gradle.properties'],
           'gradle/wrapper/gradle-wrapper.properties':
             generated.files['gradle/wrapper/gradle-wrapper.properties'],
+          ...(generated.files['.github/workflows/gradle-build.yml']
+            ? {
+                '.github/workflows/gradle-build.yml':
+                  generated.files['.github/workflows/gradle-build.yml'],
+              }
+            : {}),
         };
 
     const buildFile = nextConfig.dsl === 'kotlin' ? 'build.gradle.kts' : 'build.gradle';
@@ -570,6 +719,9 @@ export default function App() {
     setProjects((prev) => [created, ...prev]);
     setActiveProjectId(created.id);
     setDraftContents({});
+    setBuildRun(null);
+    setActionsError(null);
+    consecutiveFixRetriesRef.current = 0;
     setLeftTab('files');
   };
 
@@ -578,118 +730,319 @@ export default function App() {
       const remaining = prev.filter((p) => p.id !== id);
       if (remaining.length > 0 && activeProjectId === id) {
         setActiveProjectId(remaining[0].id);
+        setBuildRun(null);
+        setActionsError(null);
       }
       return remaining;
     });
   };
 
-  const handleSendAgentMessage = async (prompt: string, images: VisionAttachment[]) => {
-    if (!activeProject || !user) return;
-    const now = Date.now();
-    const userMsg: ChatMessage = {
-      id: `msg_${now}_u`,
-      role: 'user',
-      content: prompt || 'Analise a imagem anexada.',
-      images: images.length > 0 ? images : undefined,
-      authorLogin: user.login,
-      authorAvatar: user.avatar_url,
-      createdAt: now,
-    };
+  const handleUpdateActionsConfig = useCallback(
+    (nextCfg: GitHubActionsConfig) => {
+      setActionsError(null);
+      updateActiveProject((proj) => ({
+        ...proj,
+        githubActions: nextCfg,
+      }));
+    },
+    [updateActiveProject]
+  );
 
-    const nextMessages = [...activeProject.messages, userMsg];
-    updateActiveProject((proj) => ({
-      ...proj,
-      messages: nextMessages,
-    }));
-
-    if (wsRef.current?.readyState === WebSocket.OPEN) {
-      wsRef.current.send(JSON.stringify({ type: 'chat:message', payload: { message: userMsg } }));
-    }
-
-    setSendingChat(true);
-    try {
-      const resp = await apiFetch('/api/copilot/chat', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          model: selectedModel,
-          thinkingEnabled,
-          thinkingEffort,
-          messages: nextMessages,
-          images,
-          projectContext: {
-            config: activeProject.config,
-            files: activeProject.files,
-            folders: activeProject.folders,
-          },
-        }),
-      });
-
-      const data = (await resp.json()) as {
-        message?: ChatMessage;
-        updatedWorkspace?: {
-          config: ProjectConfig;
-          files: ChatProject['files'];
-          folders: string[];
+  const handleCreateGitHubRepo = useCallback(
+    async (
+      name: string,
+      isPrivate: boolean
+    ): Promise<{ ok: boolean; error?: string }> => {
+      if (!activeProject) return { ok: false, error: 'Nenhum projeto ativo.' };
+      try {
+        const resp = await apiFetch('/api/github/actions/create-repo', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            name,
+            isPrivate,
+            description: `${activeProject.config.name} (${activeProject.config.platform} ${activeProject.config.minecraftVersion})`,
+          }),
+        });
+        const data = (await resp.json().catch(() => ({}))) as {
+          repoFullName?: string;
+          defaultBranch?: string;
+          error?: string;
         };
-        error?: string;
+        if (!resp.ok || !data.repoFullName) {
+          return { ok: false, error: data.error || 'Erro ao criar repositório.' };
+        }
+        const currentCfg = getProjectActionsConfig(activeProject);
+        updateActiveProject((proj) => ({
+          ...proj,
+          githubActions: {
+            ...currentCfg,
+            repoFullName: data.repoFullName!,
+            branch: data.defaultBranch || currentCfg.branch || 'main',
+          },
+        }));
+        setActionsError(null);
+        return { ok: true };
+      } catch {
+        return { ok: false, error: 'Falha de conexão ao criar repositório no GitHub.' };
+      }
+    },
+    [activeProject, getProjectActionsConfig, updateActiveProject]
+  );
+
+  const handleSendAgentMessage = useCallback(
+    async (
+      prompt: string,
+      images: VisionAttachment[],
+      options?: { skipAutoBuild?: boolean; targetProject?: ChatProject }
+    ): Promise<{ nextProj: ChatProject | null; modifiedFiles: boolean }> => {
+      const targetProj = options?.targetProject || activeProjectRef.current;
+      if (!targetProj || !user) return { nextProj: null, modifiedFiles: false };
+
+      const now = Date.now();
+      const userMsg: ChatMessage = {
+        id: `msg_${now}_u`,
+        role: 'user',
+        content: prompt || 'Analise a imagem anexada.',
+        images: images.length > 0 ? images : undefined,
+        authorLogin: user.login,
+        authorAvatar: user.avatar_url,
+        createdAt: now,
       };
 
-      if (!resp.ok || !data.message) {
+      const nextMessages = [...targetProj.messages, userMsg];
+      setProjects((prev) =>
+        prev.map((proj) =>
+          proj.id === targetProj.id
+            ? { ...proj, messages: nextMessages, updatedAt: now }
+            : proj
+        )
+      );
+
+      if (wsRef.current?.readyState === WebSocket.OPEN) {
+        wsRef.current.send(
+          JSON.stringify({ type: 'chat:message', payload: { message: userMsg } })
+        );
+      }
+
+      setSendingChat(true);
+      try {
+        const resp = await apiFetch('/api/copilot/chat', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            model: selectedModel,
+            thinkingEnabled,
+            thinkingEffort,
+            messages: nextMessages,
+            images,
+            projectContext: {
+              config: targetProj.config,
+              files: targetProj.files,
+              folders: targetProj.folders,
+            },
+          }),
+        });
+
+        const data = (await resp.json()) as {
+          message?: ChatMessage;
+          updatedWorkspace?: {
+            config: ProjectConfig;
+            files: ChatProject['files'];
+            folders: string[];
+          };
+          error?: string;
+        };
+
+        if (!resp.ok || !data.message) {
+          const errMsg: ChatMessage = {
+            id: `msg_${Date.now()}_err`,
+            role: 'assistant',
+            content: data.error || 'Erro ao consultar GitHub Copilot.',
+            isError: true,
+            model: selectedModel,
+            createdAt: Date.now(),
+          };
+          setProjects((prev) =>
+            prev.map((proj) =>
+              proj.id === targetProj.id
+                ? { ...proj, messages: [...proj.messages, errMsg], updatedAt: Date.now() }
+                : proj
+            )
+          );
+          return { nextProj: null, modifiedFiles: false };
+        }
+
+        const aiMsg = data.message;
+        const updatedWs = data.updatedWorkspace;
+        const modifiedFiles = Boolean(
+          updatedWs &&
+            (aiMsg.toolCalls?.some(
+              (tc) =>
+                tc.status === 'ok' &&
+                ['write_file', 'delete_path', 'configure_gradle_project'].includes(tc.name)
+            ) ||
+              JSON.stringify(updatedWs.files) !== JSON.stringify(targetProj.files))
+        );
+
+        const nextProj: ChatProject = {
+          ...targetProj,
+          config: updatedWs ? updatedWs.config : targetProj.config,
+          files: updatedWs ? updatedWs.files : targetProj.files,
+          folders: updatedWs ? updatedWs.folders : targetProj.folders,
+          messages: [...nextMessages, aiMsg],
+          updatedAt: Date.now(),
+        };
+
+        setProjects((prev) =>
+          prev.map((proj) => {
+            if (proj.id !== targetProj.id) return proj;
+            const mergedProj: ChatProject = {
+              ...proj,
+              config: updatedWs ? updatedWs.config : proj.config,
+              files: updatedWs ? updatedWs.files : proj.files,
+              folders: updatedWs ? updatedWs.folders : proj.folders,
+              messages: [...proj.messages, aiMsg],
+              updatedAt: Date.now(),
+            };
+            if (wsRef.current?.readyState === WebSocket.OPEN) {
+              wsRef.current.send(
+                JSON.stringify({ type: 'workspace:sync', payload: { project: mergedProj } })
+              );
+            }
+            return mergedProj;
+          })
+        );
+
+        if (!options?.skipAutoBuild && modifiedFiles) {
+          const actionsCfg = getProjectActionsConfig(nextProj);
+          if (actionsCfg.autoBuildOnChange && actionsCfg.repoFullName.trim()) {
+            consecutiveFixRetriesRef.current = 0;
+            void triggerGitHubActionsBuild(
+              nextProj,
+              'CraftForge Copilot AI: alteração automática de código',
+              0
+            );
+          }
+        }
+
+        return { nextProj, modifiedFiles };
+      } catch {
         const errMsg: ChatMessage = {
-          id: `msg_${Date.now()}_err`,
+          id: `msg_${Date.now()}_neterr`,
           role: 'assistant',
-          content: data.error || 'Erro ao consultar GitHub Copilot.',
+          content: 'Falha de rede ao enviar prompt para o Agente Copilot.',
           isError: true,
           model: selectedModel,
           createdAt: Date.now(),
         };
-        updateActiveProject((proj) => ({
-          ...proj,
-          messages: [...proj.messages, errMsg],
-        }));
-        return;
+        setProjects((prev) =>
+          prev.map((proj) =>
+            proj.id === targetProj.id
+              ? { ...proj, messages: [...proj.messages, errMsg], updatedAt: Date.now() }
+              : proj
+          )
+        );
+        return { nextProj: null, modifiedFiles: false };
+      } finally {
+        setSendingChat(false);
       }
+    },
+    [
+      getProjectActionsConfig,
+      selectedModel,
+      thinkingEffort,
+      thinkingEnabled,
+      triggerGitHubActionsBuild,
+      user,
+    ]
+  );
 
-      const aiMsg = data.message;
-      const updatedWs = data.updatedWorkspace;
+  const handleFixBuildLogsInChat = useCallback(
+    async (logs: string, targetProj?: ChatProject, retryNumber?: number) => {
+      const proj = targetProj || activeProjectRef.current;
+      if (!proj) return;
+      const attemptNum = retryNumber ?? Math.max(1, consecutiveFixRetriesRef.current);
+      setAutoFixingBuild(true);
+      try {
+        const prompt = `O build no GitHub Actions falhou com os logs abaixo. Corrija os arquivos necessários usando as tools para compilar corretamente:\n\n\`\`\`\n${logs}\n\`\`\``;
+        const result = await handleSendAgentMessage(prompt, [], {
+          skipAutoBuild: true,
+          targetProject: proj,
+        });
+        const updatedProj = result.nextProj || activeProjectRef.current || proj;
+        const actionsCfg = getProjectActionsConfig(updatedProj);
+        if (actionsCfg.repoFullName.trim()) {
+          await triggerGitHubActionsBuild(
+            updatedProj,
+            `CraftForge Copilot AI: correção automática #${attemptNum}`,
+            attemptNum
+          );
+        }
+      } finally {
+        setAutoFixingBuild(false);
+      }
+    },
+    [getProjectActionsConfig, handleSendAgentMessage, triggerGitHubActionsBuild]
+  );
 
-      setProjects((prev) =>
-        prev.map((proj) => {
-          if (proj.id !== activeProject.id) return proj;
-          const nextProj: ChatProject = {
-            ...proj,
-            config: updatedWs ? updatedWs.config : proj.config,
-            files: updatedWs ? updatedWs.files : proj.files,
-            folders: updatedWs ? updatedWs.folders : proj.folders,
-            messages: [...proj.messages, aiMsg],
-            updatedAt: Date.now(),
-          };
-          if (wsRef.current?.readyState === WebSocket.OPEN) {
-            wsRef.current.send(
-              JSON.stringify({ type: 'workspace:sync', payload: { project: nextProj } })
-            );
-          }
-          return nextProj;
-        })
-      );
-    } catch {
-      const errMsg: ChatMessage = {
-        id: `msg_${Date.now()}_neterr`,
-        role: 'assistant',
-        content: 'Falha de rede ao enviar prompt para o Agente Copilot.',
-        isError: true,
-        model: selectedModel,
-        createdAt: Date.now(),
-      };
-      updateActiveProject((proj) => ({
-        ...proj,
-        messages: [...proj.messages, errMsg],
-      }));
-    } finally {
-      setSendingChat(false);
-    }
-  };
+  // Poll GitHub Actions run status, auto-fix failures in chat, and auto-download JAR on success
+  useEffect(() => {
+    if (!user || !activeProject || !buildRun) return;
+    if (buildRun.status !== 'queued' && buildRun.status !== 'in_progress') return;
+
+    const actionsCfg = getProjectActionsConfig(activeProject);
+    if (!actionsCfg.repoFullName.trim()) return;
+
+    const intervalMs = user.isSandbox ? 800 : 4000;
+    const timer = window.setInterval(async () => {
+      try {
+        const params = new URLSearchParams({
+          repo: actionsCfg.repoFullName.trim(),
+          commitSha: buildRun.commitSha || '',
+          runId: String(buildRun.id || 0),
+        });
+        const resp = await apiFetch(`/api/github/actions/status?${params.toString()}`);
+        if (!resp.ok) return;
+        const data = (await resp.json()) as { run?: GitHubBuildRun | null };
+        if (!data.run) return;
+
+        const nextRun = data.run;
+        setBuildRun(nextRun);
+
+        if (shouldTriggerAutoDownload(nextRun, actionsCfg.autoDownloadJar, downloadedRunIdsRef.current)) {
+          downloadedRunIdsRef.current.add(nextRun.id);
+          consecutiveFixRetriesRef.current = 0;
+          const art = nextRun.artifacts![0];
+          const jarName = `${activeProject.config.artifactId}-${activeProject.config.version}.jar`;
+          void downloadArtifactFile(art.downloadUrl, jarName);
+        } else if (
+          shouldTriggerAutoFix(nextRun, actionsCfg.autoFixErrors, consecutiveFixRetriesRef.current) &&
+          !handledFailedRunIdsRef.current.has(nextRun.id)
+        ) {
+          handledFailedRunIdsRef.current.add(nextRun.id);
+          consecutiveFixRetriesRef.current += 1;
+          const retryCount = consecutiveFixRetriesRef.current;
+          void handleFixBuildLogsInChat(
+            nextRun.logsExcerpt || 'Falha de compilação Gradle no GitHub Actions.',
+            activeProject,
+            retryCount
+          );
+        }
+      } catch {
+        // ignore transient poll error
+      }
+    }, intervalMs);
+
+    return () => window.clearInterval(timer);
+  }, [
+    activeProject,
+    buildRun,
+    downloadArtifactFile,
+    getProjectActionsConfig,
+    handleFixBuildLogsInChat,
+    user,
+  ]);
 
   const handleInviteCollaborator = async (
     username: string
@@ -822,6 +1175,38 @@ export default function App() {
 
         {/* Zone 2: Primary Workspace Actions */}
         <div className="flex items-center gap-1.5 sm:gap-2 shrink-0">
+          <button
+            type="button"
+            onClick={() => {
+              setLeftTab('actions');
+              setMobilePane('explorer');
+            }}
+            aria-label="Abrir Build no GitHub Actions"
+            className={`px-2 sm:px-2.5 py-1.5 rounded text-xs font-medium flex items-center gap-1.5 cursor-pointer whitespace-nowrap shrink-0 transition-colors ${
+              leftTab === 'actions'
+                ? 'bg-emerald-600/20 text-emerald-300 border border-emerald-500/40'
+                : 'bg-slate-800 hover:bg-slate-700 text-slate-200'
+            }`}
+          >
+            {triggeringBuild ||
+            autoFixingBuild ||
+            buildRun?.status === 'queued' ||
+            buildRun?.status === 'in_progress' ? (
+              <Loader2 className="w-3.5 h-3.5 text-amber-400 animate-spin" />
+            ) : (
+              <Rocket className="w-3.5 h-3.5 text-emerald-400" />
+            )}
+            <span className="hidden md:inline">
+              {autoFixingBuild
+                ? 'Corrigindo Logs...'
+                : triggeringBuild ||
+                    buildRun?.status === 'queued' ||
+                    buildRun?.status === 'in_progress'
+                  ? 'Buildando...'
+                  : 'GitHub Actions'}
+            </span>
+          </button>
+
           <button
             type="button"
             onClick={() => setNewProjectOpen(true)}
@@ -971,6 +1356,31 @@ export default function App() {
             >
               <Settings2 className="w-4 h-4" />
             </button>
+            <button
+              type="button"
+              onClick={() => setLeftTab('actions')}
+              aria-label="Build no GitHub Actions"
+              title="Build no GitHub Actions"
+              className={`relative p-2 rounded-md transition-colors cursor-pointer ${
+                leftTab === 'actions'
+                  ? 'bg-emerald-500/15 text-emerald-400'
+                  : 'text-slate-400 hover:text-slate-200'
+              }`}
+            >
+              <Rocket className="w-4 h-4" />
+              {buildRun && (
+                <span
+                  aria-hidden="true"
+                  className={`absolute top-1.5 right-1.5 w-1.5 h-1.5 rounded-full ${
+                    buildRun.status !== 'completed'
+                      ? 'bg-amber-400 animate-pulse'
+                      : buildRun.conclusion === 'success'
+                        ? 'bg-emerald-400'
+                        : 'bg-red-400'
+                  }`}
+                />
+              )}
+            </button>
           </nav>
 
           {/* Active Sidebar View */}
@@ -995,6 +1405,9 @@ export default function App() {
                 onSelectProject={(id) => {
                   setActiveProjectId(id);
                   setDraftContents({});
+                  setBuildRun(null);
+                  setActionsError(null);
+                  consecutiveFixRetriesRef.current = 0;
                 }}
                 onOpenNewProject={() => setNewProjectOpen(true)}
                 onDeleteProject={handleDeleteProject}
@@ -1005,6 +1418,31 @@ export default function App() {
                 config={activeProject.config}
                 files={activeProject.files}
                 onApplyConfig={handleApplyGradleConfig}
+              />
+            )}
+            {leftTab === 'actions' && (
+              <GitHubActionsSidebar
+                projectConfig={activeProject.config}
+                actionsConfig={activeActionsConfig}
+                buildRun={buildRun}
+                triggering={triggeringBuild}
+                autoFixing={autoFixingBuild}
+                error={actionsError}
+                onUpdateConfig={handleUpdateActionsConfig}
+                onCreateRepo={handleCreateGitHubRepo}
+                onTriggerBuild={() => {
+                  consecutiveFixRetriesRef.current = 0;
+                  void triggerGitHubActionsBuild(activeProject, undefined, 0);
+                }}
+                onFixLogsInChat={(logs) => {
+                  consecutiveFixRetriesRef.current += 1;
+                  void handleFixBuildLogsInChat(
+                    logs,
+                    activeProject,
+                    consecutiveFixRetriesRef.current
+                  );
+                }}
+                onDownloadArtifact={(url, filename) => void downloadArtifactFile(url, filename)}
               />
             )}
           </div>
