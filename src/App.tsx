@@ -17,6 +17,8 @@ import type {
   ChatMessage,
   ChatProject,
   Collaborator,
+  CopilotLowLimitWarning,
+  CopilotUsageState,
   GitHubActionsConfig,
   GitHubBuildRun,
   GitHubUser,
@@ -49,9 +51,11 @@ import {
 } from './utils/fileTree';
 import { generateGradleProjectFiles } from './utils/gradleEngine';
 import {
+  GITHUB_ACTIONS_POLL_INTERVAL_MS,
   shouldTriggerAutoDownload,
   shouldTriggerAutoFix,
 } from './utils/githubActionsEngine';
+import { MAX_COPILOT_WARNINGS } from './utils/copilotQuota';
 
 type LeftTab = 'files' | 'projects' | 'gradle' | 'actions';
 type MobilePane = 'explorer' | 'editor' | 'chat';
@@ -75,6 +79,8 @@ export default function App() {
   const [thinkingEnabled, setThinkingEnabled] = useState(true);
   const [thinkingEffort, setThinkingEffort] = useState<ThinkingEffort>('medium');
   const [sendingChat, setSendingChat] = useState(false);
+  const [copilotUsage, setCopilotUsage] = useState<CopilotUsageState | null>(null);
+  const [quotaWarnings, setQuotaWarnings] = useState<CopilotLowLimitWarning[]>([]);
 
   // Realtime WebSocket state
   const [wsConnected, setWsConnected] = useState(false);
@@ -106,10 +112,14 @@ export default function App() {
             authenticated?: boolean;
             user: GitHubUser | null;
             sessionId?: string;
+            copilotUsage?: CopilotUsageState;
           };
           if (data.authenticated && data.user) {
             storeClientSession(data.sessionId, null);
-            if (active) setUser(data.user);
+            if (active) {
+              setUser(data.user);
+              if (data.copilotUsage) setCopilotUsage(data.copilotUsage);
+            }
             return;
           }
         }
@@ -131,9 +141,16 @@ export default function App() {
         if (autostart) {
           const sbRes = await apiFetch('/api/auth/sandbox', { method: 'POST' });
           if (sbRes.ok) {
-            const sbData = (await sbRes.json()) as { user: GitHubUser; sessionId?: string };
+            const sbData = (await sbRes.json()) as {
+              user: GitHubUser;
+              sessionId?: string;
+              copilotUsage?: CopilotUsageState;
+            };
             storeClientSession(sbData.sessionId, 'sandbox-autostart-token');
-            if (active) setUser(sbData.user);
+            if (active) {
+              setUser(sbData.user);
+              if (sbData.copilotUsage) setCopilotUsage(sbData.copilotUsage);
+            }
           }
         }
       } catch {
@@ -148,9 +165,16 @@ export default function App() {
     };
   }, [autostart]);
 
-  // Hydrate projects from cookie-keyed backend + cookie metadata once authenticated
+  // Hydrate projects & Copilot usage once authenticated
   useEffect(() => {
     if (!user) return;
+
+    apiFetch('/api/copilot/usage')
+      .then((r) => (r.ok ? r.json() : null))
+      .then((d: { copilotUsage?: CopilotUsageState } | null) => {
+        if (d?.copilotUsage) setCopilotUsage(d.copilotUsage);
+      })
+      .catch(() => {});
 
     const loadInitial = async () => {
       const { activeProjectId: cookieActiveId } = loadProjectCookieMeta();
@@ -851,8 +875,19 @@ export default function App() {
             files: ChatProject['files'];
             folders: string[];
           };
+          copilotUsage?: CopilotUsageState;
+          quotaWarning?: CopilotLowLimitWarning | null;
           error?: string;
         };
+
+        if (data.copilotUsage) {
+          setCopilotUsage(data.copilotUsage);
+        }
+        if (data.quotaWarning) {
+          setQuotaWarnings((prev) =>
+            prev.length >= MAX_COPILOT_WARNINGS ? prev : [...prev, data.quotaWarning!]
+          );
+        }
 
         if (!resp.ok || !data.message) {
           const errMsg: ChatMessage = {
@@ -994,7 +1029,7 @@ export default function App() {
     const actionsCfg = getProjectActionsConfig(activeProject);
     if (!actionsCfg.repoFullName.trim()) return;
 
-    const intervalMs = user.isSandbox ? 800 : 4000;
+    const intervalMs = GITHUB_ACTIONS_POLL_INTERVAL_MS;
     const timer = window.setInterval(async () => {
       try {
         const params = new URLSearchParams({
@@ -1130,6 +1165,9 @@ export default function App() {
     clearClientSession();
     setUser(null);
     setProjects([]);
+    setCopilotUsage(null);
+    setQuotaWarnings([]);
+    setBuildRun(null);
   };
 
   if (!authChecked) {
@@ -1484,6 +1522,11 @@ export default function App() {
               selectedModel={selectedModel}
               thinkingEnabled={thinkingEnabled}
               thinkingEffort={thinkingEffort}
+              copilotUsage={copilotUsage}
+              quotaWarnings={quotaWarnings}
+              onDismissQuotaWarning={(id) =>
+                setQuotaWarnings((prev) => prev.filter((w) => w.id !== id))
+              }
               onChangeModel={setSelectedModel}
               onToggleThinking={() => setThinkingEnabled((t) => !t)}
               onChangeEffort={setThinkingEffort}

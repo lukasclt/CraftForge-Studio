@@ -98,6 +98,12 @@ export interface GitHubBuildArtifact {
   downloadUrl: string;
 }
 
+export interface GitHubBuildStep {
+  name: string;
+  status: 'queued' | 'in_progress' | 'completed';
+  conclusion: string | null;
+}
+
 export interface GitHubBuildRun {
   id: number;
   status: 'queued' | 'in_progress' | 'completed' | 'error';
@@ -106,8 +112,29 @@ export interface GitHubBuildRun {
   commitSha?: string;
   createdAt: string;
   logsExcerpt?: string;
+  liveLogs?: string;
+  steps?: GitHubBuildStep[];
   artifacts?: GitHubBuildArtifact[];
   autoFixAttempt?: number;
+}
+
+export interface CopilotUsageState {
+  used: number;
+  limit: number;
+  remaining: number;
+  warningsShown: number;
+  maxWarnings: number;
+  resetAt: number;
+  source: 'quota' | 'github-headers';
+}
+
+export interface CopilotLowLimitWarning {
+  id: string;
+  warningNumber: number;
+  maxWarnings: number;
+  remaining: number;
+  message: string;
+  createdAt: number;
 }
 
 export interface ChatProject {

@@ -1,13 +1,19 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import {
+  GITHUB_ACTIONS_POLL_INTERVAL_MS,
   WORKFLOW_FILE_PATH,
   extractRelevantGradleErrors,
+  formatGitHubJobLiveLogs,
   generateGradleWorkflowYaml,
   shouldTriggerAutoDownload,
   shouldTriggerAutoFix,
 } from './githubActionsEngine';
 import { createStarterProject } from './defaultProjects';
+
+test('uses 1s (1000ms) live reload interval for GitHub Actions logs', () => {
+  assert.equal(GITHUB_ACTIONS_POLL_INTERVAL_MS, 1000);
+});
 
 test('generates valid GitHub Actions Gradle workflow for Java and Gradle versions', () => {
   const proj = createStarterProject(null, {
@@ -23,6 +29,19 @@ test('generates valid GitHub Actions Gradle workflow for Java and Gradle version
   assert.match(yaml, /gradle-version: '8\.11\.1'/);
   assert.match(yaml, /gradle shadowJar build/);
   assert.match(yaml, /minecraft-build-jar/);
+});
+
+test('formats live GitHub Actions job steps and runner logs cleanly', () => {
+  const formatted = formatGitHubJobLiveLogs(
+    [
+      { name: 'Checkout repository', status: 'completed', conclusion: 'success' },
+      { name: 'Build PvPCore', status: 'in_progress', conclusion: null },
+    ],
+    '> Task :compileJava\n> Task :processResources'
+  );
+  assert.match(formatted, /✓ \[Checkout repository\]/);
+  assert.match(formatted, /▶ \[Build PvPCore\] \(executando\.\.\.\)/);
+  assert.match(formatted, /> Task :compileJava/);
 });
 
 test('extracts Gradle compilation errors cleanly from verbose CI logs', () => {

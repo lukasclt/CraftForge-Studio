@@ -1,4 +1,4 @@
-import React, { useState } from 'react';
+import React, { useEffect, useRef, useState } from 'react';
 import {
   AlertTriangle,
   CheckCircle2,
@@ -8,6 +8,7 @@ import {
   Loader2,
   Play,
   Plus,
+  Terminal,
   Wrench,
 } from 'lucide-react';
 import type { GitHubActionsConfig, GitHubBuildRun, ProjectConfig } from '../types/ide';
@@ -43,6 +44,13 @@ export const GitHubActionsSidebar: React.FC<GitHubActionsSidebarProps> = ({
   const [isPrivate, setIsPrivate] = useState(true);
   const [creatingRepo, setCreatingRepo] = useState(false);
   const [repoError, setRepoError] = useState<string | null>(null);
+  const liveLogsRef = useRef<HTMLPreElement>(null);
+
+  useEffect(() => {
+    if (liveLogsRef.current) {
+      liveLogsRef.current.scrollTop = liveLogsRef.current.scrollHeight;
+    }
+  }, [buildRun?.liveLogs]);
 
   const handleCreateRepo = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -70,7 +78,7 @@ export const GitHubActionsSidebar: React.FC<GitHubActionsSidebarProps> = ({
       <div>
         <h2 className="text-xs font-semibold text-slate-200 mb-1">Build no GitHub Actions</h2>
         <p className="text-[11px] text-slate-400">
-          Compila o projeto Gradle na nuvem do GitHub, corrige erros no chat e baixa o{' '}
+          Compila o projeto Gradle na nuvem com logs ao vivo (1s/loop), corrige erros no chat e baixa o{' '}
           <code className="font-mono text-slate-300">.jar</code> automaticamente.
         </p>
       </div>
@@ -219,11 +227,11 @@ export const GitHubActionsSidebar: React.FC<GitHubActionsSidebarProps> = ({
         )}
       </button>
 
-      {/* Live Run Status */}
+      {/* Live Run Status + 1s/loop Live Logs */}
       {buildRun && (
-        <div className="p-3 rounded-lg bg-[#0B0F17] border border-slate-800 space-y-2 text-xs">
+        <div className="p-3 rounded-lg bg-[#0B0F17] border border-slate-800 space-y-2.5 text-xs">
           <div className="flex items-center justify-between gap-2">
-            <div className="flex items-center gap-1.5">
+            <div className="flex items-center gap-1.5 min-w-0">
               {buildRun.status !== 'completed' ? (
                 <Loader2 className="w-3.5 h-3.5 text-amber-400 animate-spin shrink-0" />
               ) : buildRun.conclusion === 'success' ? (
@@ -231,7 +239,7 @@ export const GitHubActionsSidebar: React.FC<GitHubActionsSidebarProps> = ({
               ) : (
                 <AlertTriangle className="w-3.5 h-3.5 text-red-400 shrink-0" />
               )}
-              <span className="font-medium text-slate-200">
+              <span className="font-medium text-slate-200 truncate">
                 {buildRun.status !== 'completed'
                   ? 'Executando Gradle no GitHub Actions'
                   : buildRun.conclusion === 'success'
@@ -253,21 +261,41 @@ export const GitHubActionsSidebar: React.FC<GitHubActionsSidebarProps> = ({
             )}
           </div>
 
-          {buildRun.logsExcerpt && buildRun.conclusion === 'failure' && (
-            <div className="space-y-2">
-              <pre className="p-2 rounded bg-[#111827] border border-slate-800 text-[10px] font-mono text-red-300 max-h-32 overflow-auto whitespace-pre-wrap">
-                {buildRun.logsExcerpt}
-              </pre>
-              <button
-                type="button"
-                onClick={() => onFixLogsInChat(buildRun.logsExcerpt!)}
-                disabled={autoFixing}
-                className="w-full py-1.5 px-2.5 bg-slate-800 hover:bg-slate-700 text-slate-100 text-[11px] font-medium rounded flex items-center justify-center gap-1.5 cursor-pointer"
-              >
-                <Wrench className="w-3 h-3 text-emerald-400" />
-                <span>Corrigir Logs no Chat &amp; Rebuildar</span>
-              </button>
+          {/* Live 1s/loop Log Stream */}
+          <div className="space-y-1">
+            <div className="flex items-center justify-between text-[10px] text-slate-400">
+              <span className="flex items-center gap-1 font-medium text-slate-300">
+                <Terminal className="w-3 h-3 text-emerald-400" />
+                <span>Logs ao Vivo</span>
+              </span>
+              <span className="font-mono text-emerald-400">
+                {buildRun.status !== 'completed' ? '● Ao vivo · 1s/loop' : 'Finalizado'}
+              </span>
             </div>
+            <pre
+              ref={liveLogsRef}
+              aria-label="Logs ao vivo do GitHub Actions"
+              className={`p-2 rounded bg-[#06090F] border text-[10px] font-mono max-h-40 overflow-auto whitespace-pre-wrap leading-relaxed ${
+                buildRun.conclusion === 'failure'
+                  ? 'border-red-900/60 text-red-200'
+                  : 'border-slate-800 text-slate-300'
+              }`}
+            >
+              {buildRun.liveLogs ||
+                '• [GitHub Actions] Aguardando início do job e streaming de logs (1s/loop)...'}
+            </pre>
+          </div>
+
+          {buildRun.logsExcerpt && buildRun.conclusion === 'failure' && (
+            <button
+              type="button"
+              onClick={() => onFixLogsInChat(buildRun.logsExcerpt!)}
+              disabled={autoFixing}
+              className="w-full py-1.5 px-2.5 bg-slate-800 hover:bg-slate-700 text-slate-100 text-[11px] font-medium rounded flex items-center justify-center gap-1.5 cursor-pointer"
+            >
+              <Wrench className="w-3 h-3 text-emerald-400" />
+              <span>Corrigir Logs no Chat &amp; Rebuildar</span>
+            </button>
           )}
 
           {buildRun.artifacts && buildRun.artifacts.length > 0 && (

@@ -1,6 +1,7 @@
-import type { GitHubBuildRun, ProjectConfig } from '../types/ide';
+import type { GitHubBuildRun, GitHubBuildStep, ProjectConfig } from '../types/ide';
 
 export const WORKFLOW_FILE_PATH = '.github/workflows/gradle-build.yml';
+export const GITHUB_ACTIONS_POLL_INTERVAL_MS = 1000;
 
 export function generateGradleWorkflowYaml(config: ProjectConfig): string {
   const isShadowPlatform =
@@ -47,6 +48,41 @@ jobs:
             !build/libs/*-dev.jar
           if-no-files-found: warn
 `;
+}
+
+export function formatGitHubJobLiveLogs(
+  steps: GitHubBuildStep[] = [],
+  rawLogs?: string,
+  maxChars = 8000
+): string {
+  const lines: string[] = [];
+  for (const step of steps) {
+    const icon =
+      step.status === 'completed'
+        ? step.conclusion === 'failure'
+          ? '✗'
+          : '✓'
+        : step.status === 'in_progress'
+          ? '▶'
+          : '•';
+    const stateLabel =
+      step.status === 'completed'
+        ? step.conclusion || 'completed'
+        : step.status === 'in_progress'
+          ? 'executando...'
+          : 'aguardando';
+    lines.push(`${icon} [${step.name}] (${stateLabel})`);
+  }
+
+  if (rawLogs && rawLogs.trim()) {
+    if (lines.length > 0) lines.push('--- Saída Gradle / Runner ---');
+    const rawLines = rawLogs.split(/\r?\n/).slice(-120);
+    lines.push(...rawLines);
+  }
+
+  const combined = lines.join('\n');
+  if (combined.length <= maxChars) return combined;
+  return combined.slice(combined.length - maxChars);
 }
 
 export function extractRelevantGradleErrors(rawLogs: string, maxChars = 3500): string {

@@ -17,13 +17,22 @@ import {
 import {
   WORKFLOW_FILE_PATH,
   extractRelevantGradleErrors,
+  formatGitHubJobLiveLogs,
   generateGradleWorkflowYaml,
 } from './src/utils/githubActionsEngine.ts';
+import {
+  consumeCopilotUsage,
+  createInitialCopilotUsage,
+  normalizeCopilotUsage,
+  type HeaderQuotaSync,
+} from './src/utils/copilotQuota.ts';
 import type {
   ChatMessage,
   ChatProject,
   Collaborator,
+  CopilotUsageState,
   GitHubBuildRun,
+  GitHubBuildStep,
   GitHubUser,
   ToolCallRecord,
   VirtualFile,
@@ -94,6 +103,51 @@ loadSessionsFromDisk();
 function getUserProjectsFile(login: string): string {
   const safeLogin = login.toLowerCase().replace(/[^a-z0-9_-]/g, '_');
   return path.join(DATA_DIR, `projects_${safeLogin}.json`);
+}
+
+function getUserUsageFile(login: string): string {
+  const safeLogin = login.toLowerCase().replace(/[^a-z0-9_-]/g, '_');
+  return path.join(DATA_DIR, `usage_${safeLogin}.json`);
+}
+
+function loadUserCopilotUsage(login: string): CopilotUsageState {
+  const file = getUserUsageFile(login);
+  try {
+    if (fs.existsSync(file)) {
+      const parsed = JSON.parse(fs.readFileSync(file, 'utf-8')) as Partial<CopilotUsageState>;
+      return normalizeCopilotUsage(parsed);
+    }
+  } catch {
+    // ignore corrupt usage file
+  }
+  return createInitialCopilotUsage();
+}
+
+function saveUserCopilotUsage(login: string, usage: CopilotUsageState): void {
+  try {
+    if (!fs.existsSync(DATA_DIR)) {
+      fs.mkdirSync(DATA_DIR, { recursive: true });
+    }
+    fs.writeFileSync(getUserUsageFile(login), JSON.stringify(usage), 'utf-8');
+  } catch {
+    // ignore disk write issues
+  }
+}
+
+function parseGitHubRateLimitHeaders(headers: Headers): HeaderQuotaSync | undefined {
+  const limitRaw = headers.get('x-ratelimit-limit');
+  const remainingRaw = headers.get('x-ratelimit-remaining');
+  const resetRaw = headers.get('x-ratelimit-reset');
+  if (!limitRaw || !remainingRaw) return undefined;
+  const limit = Number(limitRaw);
+  const remaining = Number(remainingRaw);
+  if (!Number.isFinite(limit) || !Number.isFinite(remaining) || limit <= 0) return undefined;
+  const resetSec = resetRaw ? Number(resetRaw) : NaN;
+  return {
+    limit,
+    remaining,
+    resetAt: Number.isFinite(resetSec) ? resetSec * 1000 : undefined,
+  };
 }
 
 function getCookieOptions(req: express.Request, maxAge: number): express.CookieOptions {
@@ -242,7 +296,11 @@ async function startServer() {
       });
       saveSessionsToDisk();
       res.cookie(SESSION_COOKIE, sessionId, getCookieOptions(req, 1000 * 60 * 60 * 24 * 7));
-      return res.json({ user, sessionId });
+      return res.json({
+        user,
+        sessionId,
+        copilotUsage: loadUserCopilotUsage(user.login),
+      });
     } catch (err) {
       return res.status(401).json({
         error:
@@ -271,7 +329,11 @@ async function startServer() {
     });
     saveSessionsToDisk();
     res.cookie(SESSION_COOKIE, sessionId, getCookieOptions(req, 1000 * 60 * 60 * 2));
-    return res.json({ user, sessionId });
+    return res.json({
+      user,
+      sessionId,
+      copilotUsage: loadUserCopilotUsage(user.login),
+    });
   });
 
   app.get('/api/auth/me', (req, res) => {
@@ -279,7 +341,20 @@ async function startServer() {
     if (!session) {
       return res.status(200).json({ authenticated: false, user: null });
     }
-    return res.json({ authenticated: true, user: session.user, sessionId: session.id });
+    return res.json({
+      authenticated: true,
+      user: session.user,
+      sessionId: session.id,
+      copilotUsage: loadUserCopilotUsage(session.user.login),
+    });
+  });
+
+  app.get('/api/copilot/usage', (req, res) => {
+    const session = getSessionFromReq(req);
+    if (!session) {
+      return res.status(401).json({ error: 'Login obrigatório com GitHub Token.' });
+    }
+    return res.json({ copilotUsage: loadUserCopilotUsage(session.user.login) });
   });
 
   app.post('/api/auth/logout', (req, res) => {
@@ -677,21 +752,72 @@ async function startServer() {
         return res.json({ run: null });
       }
       entry.polls += 1;
-      // Attempt 1 fails with a realistic Gradle compilation error; Attempt >= 2 succeeds with JAR artifact!
-      if (entry.polls >= 1) {
+
+      if (entry.polls === 1) {
+        const steps: GitHubBuildStep[] = [
+          { name: 'Checkout repository', status: 'completed', conclusion: 'success' },
+          { name: 'Setup Java & Gradle Toolchain', status: 'in_progress', conclusion: null },
+          { name: 'Build Gradle JAR', status: 'queued', conclusion: null },
+        ];
+        entry.run = {
+          ...entry.run,
+          status: 'in_progress',
+          conclusion: null,
+          steps,
+          liveLogs: formatGitHubJobLiveLogs(
+            steps,
+            `[${new Date().toLocaleTimeString()}] Inicializando runner ubuntu-latest...\nDownloading Gradle distribution...\nStarting a Gradle Daemon...`
+          ),
+        };
+      } else if (entry.polls === 2) {
+        const steps: GitHubBuildStep[] = [
+          { name: 'Checkout repository', status: 'completed', conclusion: 'success' },
+          { name: 'Setup Java & Gradle Toolchain', status: 'completed', conclusion: 'success' },
+          { name: 'Build Gradle JAR', status: 'in_progress', conclusion: null },
+        ];
+        entry.run = {
+          ...entry.run,
+          status: 'in_progress',
+          conclusion: null,
+          steps,
+          liveLogs: formatGitHubJobLiveLogs(
+            steps,
+            `> Configure project :\n> Task :compileJava\nCompilando classes Java e dependências Gradle...`
+          ),
+        };
+      } else {
         if (entry.attempt === 1) {
+          const steps: GitHubBuildStep[] = [
+            { name: 'Checkout repository', status: 'completed', conclusion: 'success' },
+            { name: 'Setup Java & Gradle Toolchain', status: 'completed', conclusion: 'success' },
+            { name: 'Build Gradle JAR', status: 'completed', conclusion: 'failure' },
+          ];
+          const errLog =
+            '> Task :compileJava FAILED\nsrc/main/java/com/craftforge/arenapvp/ArenaPvPPlugin.java:18: error: cannot find symbol\n  symbol:   method registerBrokenPlaceholder()\n  location: class ArenaPvPPlugin\nFAILURE: Build failed with an exception.';
           entry.run = {
             ...entry.run,
             status: 'completed',
             conclusion: 'failure',
-            logsExcerpt:
-              '> Task :compileJava FAILED\nsrc/main/java/com/craftforge/arenapvp/ArenaPvPPlugin.java:18: error: cannot find symbol\n  symbol:   method registerBrokenPlaceholder()\n  location: class ArenaPvPPlugin\nFAILURE: Build failed with an exception.',
+            steps,
+            logsExcerpt: errLog,
+            liveLogs: formatGitHubJobLiveLogs(steps, errLog),
           };
         } else {
+          const steps: GitHubBuildStep[] = [
+            { name: 'Checkout repository', status: 'completed', conclusion: 'success' },
+            { name: 'Setup Java & Gradle Toolchain', status: 'completed', conclusion: 'success' },
+            { name: 'Build Gradle JAR', status: 'completed', conclusion: 'success' },
+            { name: 'Upload Compiled JAR Artifact', status: 'completed', conclusion: 'success' },
+          ];
           entry.run = {
             ...entry.run,
             status: 'completed',
             conclusion: 'success',
+            steps,
+            liveLogs: formatGitHubJobLiveLogs(
+              steps,
+              `> Task :compileJava UP-TO-DATE\n> Task :processResources\n> Task :jar\n> Task :build\nBUILD SUCCESSFUL in 3s\nArtifact minecraft-build-jar (${repo}-1.0.0.jar) enviado!`
+            ),
             artifacts: [
               {
                 id: 9001,
@@ -747,6 +873,7 @@ async function startServer() {
             htmlUrl: `https://github.com/${owner}/${repo}/actions`,
             commitSha,
             createdAt: new Date().toISOString(),
+            liveLogs: '• [GitHub Actions] Aguardando criação do runner na fila...',
           } satisfies GitHubBuildRun,
         });
       }
@@ -760,32 +887,56 @@ async function startServer() {
         createdAt: matched.created_at,
       };
 
-      if (resultRun.status === 'completed' && resultRun.conclusion === 'failure') {
-        try {
-          const jobsResp = await fetch(
-            `https://api.github.com/repos/${owner}/${repo}/actions/runs/${matched.id}/jobs`,
-            { headers: ghHeaders }
-          );
-          if (jobsResp.ok) {
-            const jobsData = (await jobsResp.json()) as {
-              jobs?: Array<{ id: number; conclusion: string | null }>;
-            };
-            const failedJob =
-              jobsData.jobs?.find((j) => j.conclusion === 'failure') || jobsData.jobs?.[0];
-            if (failedJob) {
+      // Fetch live job steps & available logs on every 1s poll
+      try {
+        const jobsResp = await fetch(
+          `https://api.github.com/repos/${owner}/${repo}/actions/runs/${matched.id}/jobs`,
+          { headers: ghHeaders }
+        );
+        if (jobsResp.ok) {
+          const jobsData = (await jobsResp.json()) as {
+            jobs?: Array<{
+              id: number;
+              status: string;
+              conclusion: string | null;
+              steps?: Array<{
+                name: string;
+                status: 'queued' | 'in_progress' | 'completed';
+                conclusion: string | null;
+              }>;
+            }>;
+          };
+          const primaryJob =
+            jobsData.jobs?.find((j) => j.conclusion === 'failure') || jobsData.jobs?.[0];
+          if (primaryJob) {
+            const steps: GitHubBuildStep[] = (primaryJob.steps || []).map((s) => ({
+              name: s.name,
+              status: s.status,
+              conclusion: s.conclusion,
+            }));
+            resultRun.steps = steps;
+
+            let rawLogs = '';
+            try {
               const logsResp = await fetch(
-                `https://api.github.com/repos/${owner}/${repo}/actions/jobs/${failedJob.id}/logs`,
+                `https://api.github.com/repos/${owner}/${repo}/actions/jobs/${primaryJob.id}/logs`,
                 { headers: ghHeaders }
               );
               if (logsResp.ok) {
-                const rawLogs = await logsResp.text();
-                resultRun.logsExcerpt = extractRelevantGradleErrors(rawLogs);
+                rawLogs = await logsResp.text();
               }
+            } catch {
+              // raw job logs may not be ready until step/job completes
+            }
+
+            resultRun.liveLogs = formatGitHubJobLiveLogs(steps, rawLogs);
+            if (resultRun.status === 'completed' && resultRun.conclusion === 'failure' && rawLogs) {
+              resultRun.logsExcerpt = extractRelevantGradleErrors(rawLogs);
             }
           }
-        } catch {
-          // ignore log fetch error
         }
+      } catch {
+        // ignore live job fetch error
       }
 
       if (resultRun.status === 'completed' && resultRun.conclusion === 'success') {
@@ -933,11 +1084,19 @@ async function startServer() {
     return res.json({ ok: true, onlineUsers: getRoomOnlineUsers(room) });
   });
 
-  // --- GitHub Copilot / Models Agent Chat (TOOLS + VISION + THINKING) ---
+  // --- GitHub Copilot / Models Agent Chat (TOOLS + VISION + THINKING + QUOTA) ---
   app.post('/api/copilot/chat', async (req, res) => {
     const session = getSessionFromReq(req);
     if (!session) {
       return res.status(401).json({ error: 'Autenticação via GitHub Token obrigatória.' });
+    }
+
+    const currentUsage = loadUserCopilotUsage(session.user.login);
+    if (currentUsage.remaining <= 0) {
+      return res.status(429).json({
+        error: `Limite de uso do GitHub Copilot atingido (${currentUsage.used}/${currentUsage.limit}). Aguarde a renovação da cota.`,
+        copilotUsage: currentUsage,
+      });
     }
 
     const {
@@ -1005,6 +1164,9 @@ async function startServer() {
         ? `1. Analisando projeto ${workingState.config.name} (${workingState.config.platform}, Minecraft ${workingState.config.minecraftVersion}, Java ${workingState.config.javaVersion}).\n2. Verificando toolchain Gradle ${workingState.config.gradleVersion}${hasImages ? ' e imagem anexada via Vision' : ''}.\n3. Executando validação de estrutura e ferramentas no workspace.`
         : '';
 
+      const quotaStep = consumeCopilotUsage(currentUsage);
+      saveUserCopilotUsage(session.user.login, quotaStep.nextUsage);
+
       return res.json({
         message: {
           id: `msg_${Date.now()}`,
@@ -1016,6 +1178,8 @@ async function startServer() {
           createdAt: Date.now(),
         },
         updatedWorkspace: workingState,
+        copilotUsage: quotaStep.nextUsage,
+        quotaWarning: quotaStep.warning,
       });
     }
 
@@ -1074,6 +1238,7 @@ Regras do Agente:
 
       let finalContent = '';
       let finalThinking = '';
+      let latestHeaderQuota: HeaderQuotaSync | undefined;
       const maxRounds = 4;
 
       for (let round = 0; round < maxRounds; round++) {
@@ -1095,8 +1260,24 @@ Regras do Agente:
           body: JSON.stringify(payload),
         });
 
+        const parsedHeaders = parseGitHubRateLimitHeaders(aiResp.headers);
+        if (parsedHeaders) latestHeaderQuota = parsedHeaders;
+
         if (!aiResp.ok) {
           const errText = await aiResp.text().catch(() => '');
+          if (aiResp.status === 429) {
+            const exhausted = consumeCopilotUsage(currentUsage, {
+              limit: latestHeaderQuota?.limit || currentUsage.limit,
+              remaining: 0,
+              resetAt: latestHeaderQuota?.resetAt,
+            });
+            saveUserCopilotUsage(session.user.login, exhausted.nextUsage);
+            return res.status(429).json({
+              error: `Limite de uso do GitHub Copilot / Models atingido (HTTP 429).`,
+              copilotUsage: exhausted.nextUsage,
+              quotaWarning: exhausted.warning,
+            });
+          }
           return res.status(aiResp.status).json({
             error: `GitHub Copilot / Models retornou HTTP ${aiResp.status}: ${
               errText.slice(0, 300) ||
@@ -1177,6 +1358,9 @@ Regras do Agente:
         finalContent = 'Alterações aplicadas no projeto via ferramentas do agente.';
       }
 
+      const quotaStep = consumeCopilotUsage(currentUsage, latestHeaderQuota);
+      saveUserCopilotUsage(session.user.login, quotaStep.nextUsage);
+
       return res.json({
         message: {
           id: `msg_${Date.now()}`,
@@ -1188,6 +1372,8 @@ Regras do Agente:
           createdAt: Date.now(),
         },
         updatedWorkspace: workingState,
+        copilotUsage: quotaStep.nextUsage,
+        quotaWarning: quotaStep.warning,
       });
     } catch (err) {
       return res.status(500).json({

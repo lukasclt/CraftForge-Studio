@@ -1,10 +1,10 @@
 import React, { useRef, useState } from 'react';
 import {
+  AlertTriangle,
   BrainCircuit,
-  ChevronDown,
-  ChevronRight,
   Copy,
   Check,
+  Gauge,
   ImagePlus,
   Send,
   Wrench,
@@ -12,6 +12,8 @@ import {
 } from 'lucide-react';
 import type {
   ChatMessage,
+  CopilotLowLimitWarning,
+  CopilotUsageState,
   ThinkingEffort,
   VisionAttachment,
 } from '../types/ide';
@@ -40,6 +42,9 @@ interface CopilotAgentChatProps {
   selectedModel: string;
   thinkingEnabled: boolean;
   thinkingEffort: ThinkingEffort;
+  copilotUsage: CopilotUsageState | null;
+  quotaWarnings: CopilotLowLimitWarning[];
+  onDismissQuotaWarning: (id: string) => void;
   onChangeModel: (model: string) => void;
   onToggleThinking: () => void;
   onChangeEffort: (effort: ThinkingEffort) => void;
@@ -53,6 +58,9 @@ export const CopilotAgentChat: React.FC<CopilotAgentChatProps> = ({
   selectedModel,
   thinkingEnabled,
   thinkingEffort,
+  copilotUsage,
+  quotaWarnings,
+  onDismissQuotaWarning,
   onChangeModel,
   onToggleThinking,
   onChangeEffort,
@@ -206,6 +214,56 @@ export const CopilotAgentChat: React.FC<CopilotAgentChatProps> = ({
             ))}
           </div>
         )}
+
+        {/* Copilot Usage Limit Meter */}
+        {copilotUsage && (
+          <div
+            aria-label={`Limite do GitHub Copilot: ${copilotUsage.used} de ${copilotUsage.limit} usados`}
+            className="px-2.5 py-1.5 rounded-md bg-[#0B0F17] border border-slate-800 space-y-1"
+          >
+            <div className="flex items-center justify-between gap-2 text-[11px]">
+              <span className="flex items-center gap-1.5 text-slate-300 font-medium">
+                <Gauge
+                  className={`w-3.5 h-3.5 ${
+                    copilotUsage.remaining === 0
+                      ? 'text-red-400'
+                      : copilotUsage.remaining <= 5
+                        ? 'text-amber-400'
+                        : 'text-emerald-400'
+                  }`}
+                />
+                <span>
+                  Limite Copilot: {copilotUsage.used}/{copilotUsage.limit}
+                </span>
+              </span>
+              <span
+                className={`font-mono tabular-nums ${
+                  copilotUsage.remaining === 0
+                    ? 'text-red-400 font-semibold'
+                    : copilotUsage.remaining <= 5
+                      ? 'text-amber-300 font-semibold'
+                      : 'text-slate-400'
+                }`}
+              >
+                {copilotUsage.remaining} restantes
+              </span>
+            </div>
+            <div className="h-1 w-full rounded-full bg-slate-800 overflow-hidden">
+              <div
+                className={`h-full transition-all duration-300 ${
+                  copilotUsage.remaining === 0
+                    ? 'bg-red-500'
+                    : copilotUsage.remaining <= 5
+                      ? 'bg-amber-400'
+                      : 'bg-emerald-500'
+                }`}
+                style={{
+                  width: `${Math.min(100, Math.round((copilotUsage.used / Math.max(1, copilotUsage.limit)) * 100))}%`,
+                }}
+              />
+            </div>
+          </div>
+        )}
       </div>
 
       {/* Messages Feed */}
@@ -329,8 +387,43 @@ export const CopilotAgentChat: React.FC<CopilotAgentChatProps> = ({
         <div ref={scrollEndRef} />
       </div>
 
+      {/* Low-limit warnings (capped at 5 warnings) */}
+      {quotaWarnings.length > 0 && (
+        <div className="px-3 pt-2 space-y-1.5 border-t border-slate-800 bg-[#0D131F]">
+          {quotaWarnings.map((warn) => (
+            <div
+              key={warn.id}
+              role="alert"
+              className="flex items-start justify-between gap-2 p-2 rounded-md bg-amber-950/50 border border-amber-700/60 text-[11px] text-amber-200"
+            >
+              <div className="flex items-start gap-1.5 min-w-0">
+                <AlertTriangle className="w-3.5 h-3.5 text-amber-400 shrink-0 mt-0.5" />
+                <span className="leading-snug">{warn.message}</span>
+              </div>
+              <button
+                type="button"
+                onClick={() => onDismissQuotaWarning(warn.id)}
+                aria-label={`Fechar aviso ${warn.warningNumber}`}
+                className="text-amber-300/70 hover:text-amber-100 p-0.5 cursor-pointer shrink-0"
+              >
+                <X className="w-3 h-3" />
+              </button>
+            </div>
+          ))}
+        </div>
+      )}
+
       {/* Composer */}
       <form onSubmit={handleSubmit} className="p-3 border-t border-slate-800 bg-[#0B0F17] space-y-2">
+        {copilotUsage && copilotUsage.remaining <= 0 && (
+          <div
+            role="alert"
+            className="p-2 rounded bg-red-950/50 border border-red-800/60 text-[11px] text-red-200"
+          >
+            Limite de uso do GitHub Copilot atingido ({copilotUsage.used}/{copilotUsage.limit}).
+          </div>
+        )}
+
         {images.length > 0 && (
           <div className="flex flex-wrap gap-2">
             {images.map((img) => (
@@ -358,6 +451,7 @@ export const CopilotAgentChat: React.FC<CopilotAgentChatProps> = ({
           value={prompt}
           onChange={(e) => setPrompt(e.target.value)}
           onPaste={handlePaste}
+          disabled={copilotUsage?.remaining === 0}
           onKeyDown={(e) => {
             if (e.key === 'Enter' && !e.shiftKey) {
               e.preventDefault();
@@ -365,8 +459,12 @@ export const CopilotAgentChat: React.FC<CopilotAgentChatProps> = ({
             }
           }}
           rows={3}
-          placeholder="Peça um comando, módulo PvP, Mixin, ou cole um print (Vision)..."
-          className="w-full bg-[#111827] border border-slate-800 focus:border-emerald-500 rounded-lg p-2.5 text-xs text-slate-100 placeholder:text-slate-500 resize-none focus:outline-none"
+          placeholder={
+            copilotUsage?.remaining === 0
+              ? 'Limite do GitHub Copilot atingido...'
+              : 'Peça um comando, módulo PvP, Mixin, ou cole um print (Vision)...'
+          }
+          className="w-full bg-[#111827] border border-slate-800 focus:border-emerald-500 disabled:opacity-50 rounded-lg p-2.5 text-xs text-slate-100 placeholder:text-slate-500 resize-none focus:outline-none"
         />
 
         <div className="flex items-center justify-between gap-2">
@@ -382,8 +480,9 @@ export const CopilotAgentChat: React.FC<CopilotAgentChatProps> = ({
             <button
               type="button"
               onClick={() => fileInputRef.current?.click()}
+              disabled={copilotUsage?.remaining === 0}
               aria-label="Anexar Imagem (Vision)"
-              className="px-2.5 py-1.5 bg-slate-800 hover:bg-slate-700 text-slate-200 rounded-md text-xs flex items-center gap-1.5 cursor-pointer whitespace-nowrap"
+              className="px-2.5 py-1.5 bg-slate-800 hover:bg-slate-700 disabled:opacity-50 text-slate-200 rounded-md text-xs flex items-center gap-1.5 cursor-pointer whitespace-nowrap"
             >
               <ImagePlus className="w-3.5 h-3.5 text-emerald-400" />
               <span>Vision</span>
@@ -392,7 +491,11 @@ export const CopilotAgentChat: React.FC<CopilotAgentChatProps> = ({
 
           <button
             type="submit"
-            disabled={sending || (!prompt.trim() && images.length === 0)}
+            disabled={
+              sending ||
+              copilotUsage?.remaining === 0 ||
+              (!prompt.trim() && images.length === 0)
+            }
             className="px-3.5 py-1.5 bg-emerald-600 hover:bg-emerald-500 disabled:opacity-50 text-white rounded-md text-xs font-semibold flex items-center gap-1.5 cursor-pointer whitespace-nowrap"
           >
             <Send className="w-3.5 h-3.5" />
