@@ -1,5 +1,5 @@
 import React, { useState } from 'react';
-import { Eye, EyeOff, KeyRound, Lock, ShieldCheck, Users } from 'lucide-react';
+import { ExternalLink, Eye, EyeOff, KeyRound, Lock, ShieldCheck, Users } from 'lucide-react';
 import type { GitHubUser } from '../types/ide';
 
 interface GitHubLoginScreenProps {
@@ -137,6 +137,26 @@ export const GitHubLoginScreen: React.FC<GitHubLoginScreenProps> = ({
             >
               {loading ? 'Validando no GitHub...' : 'Entrar com GitHub Token'}
             </button>
+
+            <div className="pt-1 flex flex-col gap-2">
+              <a
+                href="https://github.com/settings/personal-access-tokens/new?name=CraftForge%20Studio&description=IDE%20Minecraft%20Gradle%20e%20Agente%20Copilot"
+                target="_blank"
+                rel="noopener noreferrer"
+                className="w-full py-2 px-4 bg-[#0B0F17] hover:bg-slate-800 border border-slate-700 text-slate-200 text-xs font-medium rounded-lg transition-colors flex items-center justify-center gap-2 whitespace-nowrap"
+              >
+                <ExternalLink className="w-3.5 h-3.5 text-emerald-400 shrink-0" />
+                <span>Criar Key no GitHub (Fine-grained Token)</span>
+              </a>
+              <a
+                href="https://github.com/settings/tokens/new?description=CraftForge%20Studio&scopes=read:user"
+                target="_blank"
+                rel="noopener noreferrer"
+                className="text-center text-[11px] text-slate-400 hover:text-emerald-400 underline underline-offset-2 transition-colors"
+              >
+                Ou criar Token Clássico (read:user) na API do GitHub
+              </a>
+            </div>
           </form>
 
           <div className="mt-6 pt-5 border-t border-slate-800 space-y-2 text-xs text-slate-400">
