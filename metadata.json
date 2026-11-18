@@ -1,0 +1,6 @@
+{
+  "name": "CraftForge Studio",
+  "description": "IDE web estilo VS Code exclusivamente via Gradle para criar plugins, mods e clients de PvP de Minecraft em todas as versões de Minecraft e Java, com Agente GitHub Copilot (Tools, Vision, Thinking) e colaboração via GitHub Token.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
