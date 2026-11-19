@@ -70,7 +70,7 @@ export const GitHubLoginScreen: React.FC<GitHubLoginScreenProps> = ({
       }
 
       if (data && resp.ok && data.user) {
-        storeClientSession(data.sessionId, trimmed);
+        storeClientSession(data.sessionId, trimmed, data.user);
         onAuthenticated(data.user);
         return;
       }
@@ -82,13 +82,13 @@ export const GitHubLoginScreen: React.FC<GitHubLoginScreenProps> = ({
 
       // If the backend returned a non-JSON proxy/static response, validate directly with GitHub API
       const directUser = await validateDirectWithGitHub(trimmed);
-      storeClientSession(null, trimmed);
+      storeClientSession(null, trimmed, directUser);
       onAuthenticated(directUser);
     } catch (err) {
       // Fallback to direct GitHub REST API if /api/auth/github could not be reached
       try {
         const directUser = await validateDirectWithGitHub(trimmed);
-        storeClientSession(null, trimmed);
+        storeClientSession(null, trimmed, directUser);
         onAuthenticated(directUser);
       } catch (ghErr) {
         const detail =

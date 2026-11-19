@@ -150,13 +150,17 @@ function parseGitHubRateLimitHeaders(headers: Headers): HeaderQuotaSync | undefi
   };
 }
 
-function getCookieOptions(req: express.Request, maxAge: number): express.CookieOptions {
+function getCookieOptions(
+  req: express.Request,
+  maxAge: number,
+  httpOnly = true
+): express.CookieOptions {
   const isHttps =
     req.secure ||
     req.headers['x-forwarded-proto'] === 'https' ||
     (typeof req.headers.origin === 'string' && req.headers.origin.startsWith('https://'));
   return {
-    httpOnly: true,
+    httpOnly,
     sameSite: isHttps ? 'none' : 'lax',
     secure: isHttps,
     path: '/',
@@ -165,15 +169,23 @@ function getCookieOptions(req: express.Request, maxAge: number): express.CookieO
 }
 
 function getSessionFromReq(req: express.Request): AuthSession | null {
-  const sid = req.cookies?.[SESSION_COOKIE] || (req.headers['x-session-id'] as string | undefined);
+  const sid =
+    req.cookies?.[SESSION_COOKIE] ||
+    req.cookies?.cf_auth_sid ||
+    (req.headers['x-session-id'] as string | undefined);
   if (sid && sessions.has(sid)) {
     return sessions.get(sid)!;
   }
   const authHeader = req.headers.authorization;
-  if (authHeader && authHeader.startsWith('Bearer ')) {
-    const token = authHeader.slice(7).trim();
+  const bearerToken =
+    authHeader && authHeader.startsWith('Bearer ') ? authHeader.slice(7).trim() : null;
+  const cookieToken = req.cookies?.cf_auth_token
+    ? String(req.cookies.cf_auth_token).trim()
+    : null;
+  const candidateToken = bearerToken || cookieToken;
+  if (candidateToken) {
     for (const s of sessions.values()) {
-      if (s.token === token || s.id === token) return s;
+      if (s.token === candidateToken || s.id === candidateToken) return s;
     }
   }
   return null;
@@ -295,7 +307,10 @@ async function startServer() {
         createdAt: Date.now(),
       });
       saveSessionsToDisk();
-      res.cookie(SESSION_COOKIE, sessionId, getCookieOptions(req, 1000 * 60 * 60 * 24 * 7));
+      const thirtyDaysMs = 1000 * 60 * 60 * 24 * 30;
+      res.cookie(SESSION_COOKIE, sessionId, getCookieOptions(req, thirtyDaysMs, true));
+      res.cookie('cf_auth_sid', sessionId, getCookieOptions(req, thirtyDaysMs, false));
+      res.cookie('cf_auth_token', token, getCookieOptions(req, thirtyDaysMs, false));
       return res.json({
         user,
         sessionId,
@@ -336,8 +351,40 @@ async function startServer() {
     });
   });
 
-  app.get('/api/auth/me', (req, res) => {
-    const session = getSessionFromReq(req);
+  app.get('/api/auth/me', async (req, res) => {
+    let session = getSessionFromReq(req);
+
+    // If backend memory/sessions restarted, auto-restore from saved cf_auth_token cookie / Bearer token
+    if (!session) {
+      const authHeader = req.headers.authorization;
+      const bearerToken =
+        authHeader && authHeader.startsWith('Bearer ') ? authHeader.slice(7).trim() : '';
+      const cookieToken = req.cookies?.cf_auth_token
+        ? String(req.cookies.cf_auth_token).trim()
+        : '';
+      const restoreToken = cookieToken || bearerToken;
+
+      if (restoreToken && restoreToken !== 'sandbox-autostart-token' && restoreToken.length >= 10) {
+        try {
+          const user = await fetchGitHubUser(restoreToken);
+          const sessionId = crypto.randomUUID();
+          session = {
+            id: sessionId,
+            token: restoreToken,
+            user,
+            createdAt: Date.now(),
+          };
+          sessions.set(sessionId, session);
+          saveSessionsToDisk();
+          const thirtyDaysMs = 1000 * 60 * 60 * 24 * 30;
+          res.cookie(SESSION_COOKIE, sessionId, getCookieOptions(req, thirtyDaysMs, true));
+          res.cookie('cf_auth_sid', sessionId, getCookieOptions(req, thirtyDaysMs, false));
+        } catch {
+          // Token expired or invalid; fall through to unauthenticated
+        }
+      }
+    }
+
     if (!session) {
       return res.status(200).json({ authenticated: false, user: null });
     }
@@ -358,12 +405,18 @@ async function startServer() {
   });
 
   app.post('/api/auth/logout', (req, res) => {
-    const sid = req.cookies?.[SESSION_COOKIE] || (req.headers['x-session-id'] as string | undefined);
+    const sid =
+      req.cookies?.[SESSION_COOKIE] ||
+      req.cookies?.cf_auth_sid ||
+      (req.headers['x-session-id'] as string | undefined);
     if (sid) {
       sessions.delete(sid);
       saveSessionsToDisk();
     }
-    res.clearCookie(SESSION_COOKIE, getCookieOptions(req, 0));
+    res.clearCookie(SESSION_COOKIE, getCookieOptions(req, 0, true));
+    res.clearCookie('cf_auth_sid', getCookieOptions(req, 0, false));
+    res.clearCookie('cf_auth_token', getCookieOptions(req, 0, false));
+    res.clearCookie('cf_auth_user', getCookieOptions(req, 0, false));
     return res.json({ ok: true });
   });
 

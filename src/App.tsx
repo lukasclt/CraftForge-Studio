@@ -40,6 +40,7 @@ import { loadProjectCookieMeta, saveProjectsToCookies } from './utils/cookieStor
 import {
   apiFetch,
   clearClientSession,
+  getStoredAuthUser,
   getStoredGitHubToken,
   storeClientSession,
 } from './utils/sessionClient';
@@ -101,10 +102,11 @@ export default function App() {
   const inviteRoomId = urlParams?.get('room') || null;
   const autostart = urlParams?.get('autostart') === '1';
 
-  // Hydrate auth on mount
+  // Hydrate auth on mount from cookies + backend session
   useEffect(() => {
     let active = true;
     const initAuth = async () => {
+      const storedToken = getStoredGitHubToken();
       try {
         const res = await apiFetch('/api/auth/me');
         if (res.ok) {
@@ -115,7 +117,11 @@ export default function App() {
             copilotUsage?: CopilotUsageState;
           };
           if (data.authenticated && data.user) {
-            storeClientSession(data.sessionId, null);
+            storeClientSession(
+              data.sessionId,
+              storedToken && storedToken !== 'sandbox-autostart-token' ? storedToken : null,
+              data.user
+            );
             if (active) {
               setUser(data.user);
               if (data.copilotUsage) setCopilotUsage(data.copilotUsage);
@@ -123,9 +129,38 @@ export default function App() {
             return;
           }
         }
-        // Fallback: if a real GitHub token is in sessionStorage (e.g. static proxy), validate directly
-        const storedToken = getStoredGitHubToken();
+
+        // If backend session expired/restarted, silently re-authenticate using the token saved in cookies
         if (storedToken && storedToken !== 'sandbox-autostart-token') {
+          try {
+            const reAuthRes = await fetch('/api/auth/github', {
+              method: 'POST',
+              credentials: 'include',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ token: storedToken }),
+            });
+            if (reAuthRes.ok) {
+              const reData = (await reAuthRes.json()) as {
+                user?: GitHubUser;
+                sessionId?: string;
+                copilotUsage?: CopilotUsageState;
+              };
+              if (reData.user) {
+                storeClientSession(reData.sessionId, storedToken, reData.user);
+                if (active) {
+                  setUser(reData.user);
+                  if (reData.copilotUsage) setCopilotUsage(reData.copilotUsage);
+                }
+                return;
+              }
+            } else if (reAuthRes.status === 401) {
+              clearClientSession();
+              return;
+            }
+          } catch {
+            // Fall through to direct GitHub validation
+          }
+
           const ghResp = await fetch('https://api.github.com/user', {
             headers: {
               Authorization: `Bearer ${storedToken}`,
@@ -134,10 +169,16 @@ export default function App() {
           });
           if (ghResp.ok) {
             const ghUser = (await ghResp.json()) as GitHubUser;
+            storeClientSession(null, storedToken, ghUser);
             if (active) setUser(ghUser);
             return;
           }
+          if (ghResp.status === 401) {
+            clearClientSession();
+            return;
+          }
         }
+
         if (autostart) {
           const sbRes = await apiFetch('/api/auth/sandbox', { method: 'POST' });
           if (sbRes.ok) {
@@ -154,7 +195,11 @@ export default function App() {
           }
         }
       } catch {
-        // remain unauthenticated
+        // On transient offline errors, still restore cached user if cookie token is present
+        const cachedUser = getStoredAuthUser();
+        if (storedToken && storedToken !== 'sandbox-autostart-token' && cachedUser && active) {
+          setUser(cachedUser);
+        }
       } finally {
         if (active) setAuthChecked(true);
       }
