@@ -198,6 +198,7 @@ async function fetchGitHubUser(token: string): Promise<GitHubUser> {
       Accept: 'application/vnd.github+json',
       'User-Agent': 'CraftForge-Studio',
     },
+    signal: AbortSignal.timeout(15000),
   });
   if (!resp.ok) {
     const body = await resp.text().catch(() => '');
@@ -213,6 +214,46 @@ async function fetchGitHubUser(token: string): Promise<GitHubUser> {
   };
 }
 
+async function resolveOrRestoreSession(
+  req: express.Request,
+  res: express.Response
+): Promise<AuthSession | null> {
+  const existing = getSessionFromReq(req);
+  if (existing) return existing;
+
+  const authHeader = req.headers.authorization;
+  const bearerToken =
+    authHeader && authHeader.startsWith('Bearer ') ? authHeader.slice(7).trim() : '';
+  const cookieToken = req.cookies?.cf_auth_token
+    ? String(req.cookies.cf_auth_token).trim()
+    : '';
+  const restoreToken = bearerToken || cookieToken;
+
+  if (!restoreToken || restoreToken === 'sandbox-autostart-token' || restoreToken.length < 10) {
+    return null;
+  }
+
+  try {
+    const user = await fetchGitHubUser(restoreToken);
+    const sessionId = crypto.randomUUID();
+    const restored: AuthSession = {
+      id: sessionId,
+      token: restoreToken,
+      user,
+      createdAt: Date.now(),
+    };
+    sessions.set(sessionId, restored);
+    saveSessionsToDisk();
+    const thirtyDaysMs = 1000 * 60 * 60 * 24 * 30;
+    res.cookie(SESSION_COOKIE, sessionId, getCookieOptions(req, thirtyDaysMs, true));
+    res.cookie('cf_auth_sid', sessionId, getCookieOptions(req, thirtyDaysMs, false));
+    res.cookie('cf_auth_token', restoreToken, getCookieOptions(req, thirtyDaysMs, false));
+    return restored;
+  } catch {
+    return null;
+  }
+}
+
 async function resolveCopilotEndpoint(
   githubToken: string
 ): Promise<{ endpoint: string; authToken: string; extraHeaders: Record<string, string>; isCopilotNative: boolean }> {
@@ -224,6 +265,7 @@ async function resolveCopilotEndpoint(
         Accept: 'application/json',
         'User-Agent': 'CraftForge-Studio/1.0',
       },
+      signal: AbortSignal.timeout(12000),
     });
     if (exchangeResp.ok) {
       const data = (await exchangeResp.json()) as {
@@ -259,9 +301,9 @@ async function resolveCopilotEndpoint(
   };
 }
 
-function normalizeModelForEndpoint(model: string, isCopilotNative: boolean): string {
-  if (!isCopilotNative) return model;
-  // Copilot native API usually takes short model names like gpt-4o, gpt-4.1, o3-mini, claude-3.7-sonnet
+function normalizeModelForEndpoint(model: string, useShortName: boolean): string {
+  if (!useShortName) return model;
+  // Copilot native & Azure AI inference endpoints use short model names like gpt-4o, gpt-4.1, o3-mini
   return model.includes('/') ? model.split('/')[1] : model;
 }
 
@@ -352,39 +394,7 @@ async function startServer() {
   });
 
   app.get('/api/auth/me', async (req, res) => {
-    let session = getSessionFromReq(req);
-
-    // If backend memory/sessions restarted, auto-restore from saved cf_auth_token cookie / Bearer token
-    if (!session) {
-      const authHeader = req.headers.authorization;
-      const bearerToken =
-        authHeader && authHeader.startsWith('Bearer ') ? authHeader.slice(7).trim() : '';
-      const cookieToken = req.cookies?.cf_auth_token
-        ? String(req.cookies.cf_auth_token).trim()
-        : '';
-      const restoreToken = cookieToken || bearerToken;
-
-      if (restoreToken && restoreToken !== 'sandbox-autostart-token' && restoreToken.length >= 10) {
-        try {
-          const user = await fetchGitHubUser(restoreToken);
-          const sessionId = crypto.randomUUID();
-          session = {
-            id: sessionId,
-            token: restoreToken,
-            user,
-            createdAt: Date.now(),
-          };
-          sessions.set(sessionId, session);
-          saveSessionsToDisk();
-          const thirtyDaysMs = 1000 * 60 * 60 * 24 * 30;
-          res.cookie(SESSION_COOKIE, sessionId, getCookieOptions(req, thirtyDaysMs, true));
-          res.cookie('cf_auth_sid', sessionId, getCookieOptions(req, thirtyDaysMs, false));
-        } catch {
-          // Token expired or invalid; fall through to unauthenticated
-        }
-      }
-    }
-
+    const session = await resolveOrRestoreSession(req, res);
     if (!session) {
       return res.status(200).json({ authenticated: false, user: null });
     }
@@ -396,8 +406,8 @@ async function startServer() {
     });
   });
 
-  app.get('/api/copilot/usage', (req, res) => {
-    const session = getSessionFromReq(req);
+  app.get('/api/copilot/usage', async (req, res) => {
+    const session = await resolveOrRestoreSession(req, res);
     if (!session) {
       return res.status(401).json({ error: 'Login obrigatório com GitHub Token.' });
     }
@@ -421,8 +431,8 @@ async function startServer() {
   });
 
   // --- Cookie-Keyed User Projects Persistence ---
-  app.get('/api/projects', (req, res) => {
-    const session = getSessionFromReq(req);
+  app.get('/api/projects', async (req, res) => {
+    const session = await resolveOrRestoreSession(req, res);
     if (!session) {
       return res.status(401).json({ error: 'Login obrigatório com GitHub Token.' });
     }
@@ -444,8 +454,8 @@ async function startServer() {
     }
   });
 
-  app.post('/api/projects', (req, res) => {
-    const session = getSessionFromReq(req);
+  app.post('/api/projects', async (req, res) => {
+    const session = await resolveOrRestoreSession(req, res);
     if (!session) {
       return res.status(401).json({ error: 'Login obrigatório com GitHub Token.' });
     }
@@ -467,7 +477,7 @@ async function startServer() {
 
   // --- Lookup GitHub User for Collaborator Invite ---
   app.get('/api/github/user/:username', async (req, res) => {
-    const session = getSessionFromReq(req);
+    const session = await resolveOrRestoreSession(req, res);
     if (!session) {
       return res.status(401).json({ error: 'Login obrigatório com GitHub Token.' });
     }
@@ -517,7 +527,7 @@ async function startServer() {
 
   // --- GitHub Actions: Create Repository ---
   app.post('/api/github/actions/create-repo', async (req, res) => {
-    const session = getSessionFromReq(req);
+    const session = await resolveOrRestoreSession(req, res);
     if (!session) {
       return res.status(401).json({ error: 'Login obrigatório com GitHub Token.' });
     }
@@ -577,7 +587,7 @@ async function startServer() {
 
   // --- GitHub Actions: Push Files Atomically & Trigger Gradle Build ---
   app.post('/api/github/actions/trigger', async (req, res) => {
-    const session = getSessionFromReq(req);
+    const session = await resolveOrRestoreSession(req, res);
     if (!session) {
       return res.status(401).json({ error: 'Login obrigatório com GitHub Token.' });
     }
@@ -786,7 +796,7 @@ async function startServer() {
 
   // --- GitHub Actions: Poll Status, Logs & Artifacts ---
   app.get('/api/github/actions/status', async (req, res) => {
-    const session = getSessionFromReq(req);
+    const session = await resolveOrRestoreSession(req, res);
     if (!session) {
       return res.status(401).json({ error: 'Login obrigatório com GitHub Token.' });
     }
@@ -1022,7 +1032,7 @@ async function startServer() {
 
   // --- GitHub Actions: Download Compiled JAR (extracts .jar from GitHub artifact zip) ---
   app.get('/api/github/actions/artifact', async (req, res) => {
-    const session = getSessionFromReq(req);
+    const session = await resolveOrRestoreSession(req, res);
     if (!session) {
       return res.status(401).json({ error: 'Login obrigatório com GitHub Token.' });
     }
@@ -1088,8 +1098,8 @@ async function startServer() {
   });
 
   // --- Room State & Invite Sync ---
-  app.get('/api/rooms/:roomId', (req, res) => {
-    const session = getSessionFromReq(req);
+  app.get('/api/rooms/:roomId', async (req, res) => {
+    const session = await resolveOrRestoreSession(req, res);
     if (!session) {
       return res.status(401).json({ error: 'Login obrigatório com GitHub Token.' });
     }
@@ -1105,8 +1115,8 @@ async function startServer() {
     });
   });
 
-  app.post('/api/rooms/:roomId/sync', (req, res) => {
-    const session = getSessionFromReq(req);
+  app.post('/api/rooms/:roomId/sync', async (req, res) => {
+    const session = await resolveOrRestoreSession(req, res);
     if (!session) {
       return res.status(401).json({ error: 'Login obrigatório com GitHub Token.' });
     }
@@ -1139,7 +1149,7 @@ async function startServer() {
 
   // --- GitHub Copilot / Models Agent Chat (TOOLS + VISION + THINKING + QUOTA) ---
   app.post('/api/copilot/chat', async (req, res) => {
-    const session = getSessionFromReq(req);
+    const session = await resolveOrRestoreSession(req, res);
     if (!session) {
       return res.status(401).json({ error: 'Autenticação via GitHub Token obrigatória.' });
     }
@@ -1240,7 +1250,6 @@ async function startServer() {
       const { endpoint, authToken, extraHeaders, isCopilotNative } = await resolveCopilotEndpoint(
         session.token
       );
-      const resolvedModel = normalizeModelForEndpoint(model, isCopilotNative);
 
       const systemPrompt = `Você é o Agente Especialista em Minecraft Gradle do CraftForge Studio (via GitHub Copilot).
 Você domina TODAS as versões do Minecraft (1.7.10 até 1.21.5+) e TODAS as versões do Java (Java 8 até Java 24), exclusivamente usando Gradle (build.gradle / build.gradle.kts, Java Toolchains, Paper/Spigot/Velocity/Fabric/Forge/NeoForge/Mixin PvP Clients).
@@ -1295,23 +1304,42 @@ Regras do Agente:
       const maxRounds = 4;
 
       for (let round = 0; round < maxRounds; round++) {
-        const payload: Record<string, unknown> = {
-          model: resolvedModel,
+        const makePayload = (useShortName: boolean) => ({
+          model: normalizeModelForEndpoint(model, isCopilotNative || useShortName),
           messages: apiMessages,
           tools: COPILOT_TOOL_DEFINITIONS,
           tool_choice: 'auto',
-        };
-
-        const aiResp = await fetch(endpoint, {
-          method: 'POST',
-          headers: {
-            'Content-Type': 'application/json',
-            Authorization: `Bearer ${authToken}`,
-            'User-Agent': 'CraftForge-Studio/1.0',
-            ...extraHeaders,
-          },
-          body: JSON.stringify(payload),
         });
+
+        let aiResp: Response;
+        try {
+          aiResp = await fetch(endpoint, {
+            method: 'POST',
+            headers: {
+              'Content-Type': 'application/json',
+              Authorization: `Bearer ${authToken}`,
+              'User-Agent': 'CraftForge-Studio/1.0',
+              ...extraHeaders,
+            },
+            body: JSON.stringify(makePayload(false)),
+            signal: AbortSignal.timeout(45000),
+          });
+        } catch (primaryErr) {
+          if (!isCopilotNative) {
+            aiResp = await fetch('https://models.inference.ai.azure.com/chat/completions', {
+              method: 'POST',
+              headers: {
+                'Content-Type': 'application/json',
+                Authorization: `Bearer ${authToken}`,
+                'User-Agent': 'CraftForge-Studio/1.0',
+              },
+              body: JSON.stringify(makePayload(true)),
+              signal: AbortSignal.timeout(45000),
+            });
+          } else {
+            throw primaryErr;
+          }
+        }
 
         const parsedHeaders = parseGitHubRateLimitHeaders(aiResp.headers);
         if (parsedHeaders) latestHeaderQuota = parsedHeaders;

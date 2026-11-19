@@ -57,6 +57,10 @@ import {
   shouldTriggerAutoFix,
 } from './utils/githubActionsEngine';
 import { MAX_COPILOT_WARNINGS } from './utils/copilotQuota';
+import {
+  prepareCompactMessagesForApi,
+  runDirectCopilotModelsFallback,
+} from './utils/copilotClientFallback';
 
 type LeftTab = 'files' | 'projects' | 'gradle' | 'actions';
 type MobilePane = 'explorer' | 'editor' | 'chat';
@@ -896,24 +900,7 @@ export default function App() {
 
       setSendingChat(true);
       try {
-        const resp = await apiFetch('/api/copilot/chat', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            model: selectedModel,
-            thinkingEnabled,
-            thinkingEffort,
-            messages: nextMessages,
-            images,
-            projectContext: {
-              config: targetProj.config,
-              files: targetProj.files,
-              folders: targetProj.folders,
-            },
-          }),
-        });
-
-        const data = (await resp.json()) as {
+        type ChatApiResponse = {
           message?: ChatMessage;
           updatedWorkspace?: {
             config: ProjectConfig;
@@ -925,20 +912,147 @@ export default function App() {
           error?: string;
         };
 
-        if (data.copilotUsage) {
-          setCopilotUsage(data.copilotUsage);
-        }
-        if (data.quotaWarning) {
-          setQuotaWarnings((prev) =>
-            prev.length >= MAX_COPILOT_WARNINGS ? prev : [...prev, data.quotaWarning!]
+        const compactMessages = prepareCompactMessagesForApi(nextMessages);
+        let data: ChatApiResponse | null = null;
+        let respOk = false;
+        let respStatus = 0;
+
+        const applySuccessfulAgentResponse = (
+          aiMsg: ChatMessage,
+          updatedWs?: ChatApiResponse['updatedWorkspace']
+        ) => {
+          const modifiedFiles = Boolean(
+            updatedWs &&
+              (aiMsg.toolCalls?.some(
+                (tc) =>
+                  tc.status === 'ok' &&
+                  ['write_file', 'delete_path', 'configure_gradle_project'].includes(tc.name)
+              ) ||
+                JSON.stringify(updatedWs.files) !== JSON.stringify(targetProj.files))
           );
+
+          const nextProj: ChatProject = {
+            ...targetProj,
+            config: updatedWs ? updatedWs.config : targetProj.config,
+            files: updatedWs ? updatedWs.files : targetProj.files,
+            folders: updatedWs ? updatedWs.folders : targetProj.folders,
+            messages: [...nextMessages, aiMsg],
+            updatedAt: Date.now(),
+          };
+
+          setProjects((prev) =>
+            prev.map((proj) => {
+              if (proj.id !== targetProj.id) return proj;
+              const mergedProj: ChatProject = {
+                ...proj,
+                config: updatedWs ? updatedWs.config : proj.config,
+                files: updatedWs ? updatedWs.files : proj.files,
+                folders: updatedWs ? updatedWs.folders : proj.folders,
+                messages: [...proj.messages, aiMsg],
+                updatedAt: Date.now(),
+              };
+              if (wsRef.current?.readyState === WebSocket.OPEN) {
+                wsRef.current.send(
+                  JSON.stringify({ type: 'workspace:sync', payload: { project: mergedProj } })
+                );
+              }
+              return mergedProj;
+            })
+          );
+
+          if (!options?.skipAutoBuild && modifiedFiles) {
+            const actionsCfg = getProjectActionsConfig(nextProj);
+            if (actionsCfg.autoBuildOnChange && actionsCfg.repoFullName.trim()) {
+              consecutiveFixRetriesRef.current = 0;
+              void triggerGitHubActionsBuild(
+                nextProj,
+                'CraftForge Copilot AI: alteração automática de código',
+                0
+              );
+            }
+          }
+
+          return { nextProj, modifiedFiles };
+        };
+
+        try {
+          const resp = await apiFetch('/api/copilot/chat', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              model: selectedModel,
+              thinkingEnabled,
+              thinkingEffort,
+              messages: compactMessages,
+              images,
+              projectContext: {
+                config: targetProj.config,
+                files: targetProj.files,
+                folders: targetProj.folders,
+              },
+            }),
+          });
+          respOk = resp.ok;
+          respStatus = resp.status;
+          const rawText = await resp.text();
+          try {
+            data = rawText ? (JSON.parse(rawText) as ChatApiResponse) : null;
+          } catch {
+            data = null;
+          }
+        } catch (fetchErr) {
+          // Network/transport failure calling local /api/copilot/chat — try direct GitHub Models API if real token exists
+          const storedToken = getStoredGitHubToken();
+          if (storedToken && storedToken !== 'sandbox-autostart-token') {
+            const fallbackResult = await runDirectCopilotModelsFallback({
+              githubToken: storedToken,
+              userLogin: user.login,
+              model: selectedModel,
+              thinkingEnabled,
+              thinkingEffort,
+              messages: nextMessages,
+              images,
+              projectContext: {
+                config: targetProj.config,
+                files: targetProj.files,
+                folders: targetProj.folders,
+              },
+            });
+            return applySuccessfulAgentResponse(
+              fallbackResult.message,
+              fallbackResult.updatedWorkspace
+            );
+          }
+          throw fetchErr;
         }
 
-        if (!resp.ok || !data.message) {
+        // If proxy returned non-JSON (e.g., HTML 502/504/404 page), try direct GitHub Models API when real token exists
+        if (!data) {
+          const storedToken = getStoredGitHubToken();
+          if (storedToken && storedToken !== 'sandbox-autostart-token') {
+            const fallbackResult = await runDirectCopilotModelsFallback({
+              githubToken: storedToken,
+              userLogin: user.login,
+              model: selectedModel,
+              thinkingEnabled,
+              thinkingEffort,
+              messages: nextMessages,
+              images,
+              projectContext: {
+                config: targetProj.config,
+                files: targetProj.files,
+                folders: targetProj.folders,
+              },
+            });
+            return applySuccessfulAgentResponse(
+              fallbackResult.message,
+              fallbackResult.updatedWorkspace
+            );
+          }
           const errMsg: ChatMessage = {
             id: `msg_${Date.now()}_err`,
             role: 'assistant',
-            content: data.error || 'Erro ao consultar GitHub Copilot.',
+            content: `Servidor retornou resposta inválida (HTTP ${respStatus || 502}) ao enviar prompt para o Agente Copilot.`,
             isError: true,
             model: selectedModel,
             createdAt: Date.now(),
@@ -953,65 +1067,41 @@ export default function App() {
           return { nextProj: null, modifiedFiles: false };
         }
 
-        const aiMsg = data.message;
-        const updatedWs = data.updatedWorkspace;
-        const modifiedFiles = Boolean(
-          updatedWs &&
-            (aiMsg.toolCalls?.some(
-              (tc) =>
-                tc.status === 'ok' &&
-                ['write_file', 'delete_path', 'configure_gradle_project'].includes(tc.name)
-            ) ||
-              JSON.stringify(updatedWs.files) !== JSON.stringify(targetProj.files))
-        );
-
-        const nextProj: ChatProject = {
-          ...targetProj,
-          config: updatedWs ? updatedWs.config : targetProj.config,
-          files: updatedWs ? updatedWs.files : targetProj.files,
-          folders: updatedWs ? updatedWs.folders : targetProj.folders,
-          messages: [...nextMessages, aiMsg],
-          updatedAt: Date.now(),
-        };
-
-        setProjects((prev) =>
-          prev.map((proj) => {
-            if (proj.id !== targetProj.id) return proj;
-            const mergedProj: ChatProject = {
-              ...proj,
-              config: updatedWs ? updatedWs.config : proj.config,
-              files: updatedWs ? updatedWs.files : proj.files,
-              folders: updatedWs ? updatedWs.folders : proj.folders,
-              messages: [...proj.messages, aiMsg],
-              updatedAt: Date.now(),
-            };
-            if (wsRef.current?.readyState === WebSocket.OPEN) {
-              wsRef.current.send(
-                JSON.stringify({ type: 'workspace:sync', payload: { project: mergedProj } })
-              );
-            }
-            return mergedProj;
-          })
-        );
-
-        if (!options?.skipAutoBuild && modifiedFiles) {
-          const actionsCfg = getProjectActionsConfig(nextProj);
-          if (actionsCfg.autoBuildOnChange && actionsCfg.repoFullName.trim()) {
-            consecutiveFixRetriesRef.current = 0;
-            void triggerGitHubActionsBuild(
-              nextProj,
-              'CraftForge Copilot AI: alteração automática de código',
-              0
-            );
-          }
+        if (data.copilotUsage) {
+          setCopilotUsage(data.copilotUsage);
+        }
+        if (data.quotaWarning) {
+          setQuotaWarnings((prev) =>
+            prev.length >= MAX_COPILOT_WARNINGS ? prev : [...prev, data.quotaWarning!]
+          );
         }
 
-        return { nextProj, modifiedFiles };
-      } catch {
+        if (!respOk || !data.message) {
+          const errMsg: ChatMessage = {
+            id: `msg_${Date.now()}_err`,
+            role: 'assistant',
+            content: data.error || `Erro ao consultar GitHub Copilot (HTTP ${respStatus}).`,
+            isError: true,
+            model: selectedModel,
+            createdAt: Date.now(),
+          };
+          setProjects((prev) =>
+            prev.map((proj) =>
+              proj.id === targetProj.id
+                ? { ...proj, messages: [...proj.messages, errMsg], updatedAt: Date.now() }
+                : proj
+            )
+          );
+          return { nextProj: null, modifiedFiles: false };
+        }
+
+        return applySuccessfulAgentResponse(data.message, data.updatedWorkspace);
+      } catch (err) {
+        const detail = err instanceof Error && err.message ? ` (${err.message})` : '';
         const errMsg: ChatMessage = {
           id: `msg_${Date.now()}_neterr`,
           role: 'assistant',
-          content: 'Falha de rede ao enviar prompt para o Agente Copilot.',
+          content: `Falha de rede ao enviar prompt para o Agente Copilot${detail}. Verifique sua conexão e as permissões do GitHub Token (models:read).`,
           isError: true,
           model: selectedModel,
           createdAt: Date.now(),
